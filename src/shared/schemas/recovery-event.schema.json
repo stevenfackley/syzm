@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://syzm.ai/schemas/recovery-event.schema.json",
+  "title": "Syzm Recovery Event",
+  "type": "object",
+  "required": ["invoice_id", "region", "original_amount_cents", "processor_origin"],
+  "properties": {
+    "invoice_id": { "type": "string", "minLength": 1 },
+    "decline_code": { "type": ["string", "null"] },
+    "bank_bin": { "type": ["string", "null"], "pattern": "^\\d{6,8}$" },
+    "region": { "type": "string", "minLength": 2, "maxLength": 16 },
+    "retry_count": { "type": "integer", "minimum": 0, "maximum": 3 },
+    "original_amount_cents": { "type": "integer", "minimum": 0 },
+    "processor_origin": { "type": "string", "enum": ["stripe", "adyen", "braintree"] },
+    "processor_history": {
+      "type": "array",
+      "items": { "type": "string", "enum": ["stripe", "adyen", "braintree"] }
+    }
+  },
+  "additionalProperties": true
+}
+

@@ -1,0 +1,42 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: syzm-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: syzm
+      POSTGRES_PASSWORD: syzm
+      POSTGRES_DB: syzm
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  brain:
+    build:
+      context: ../brain
+      dockerfile: Dockerfile
+    container_name: syzm-brain
+    environment:
+      SYZM_ENV: dev
+      SYZM_MODEL_URI: models/latest.json
+      SYZM_DEFAULT_RETRY_DELAY_MINUTES: 90
+      SYZM_MAX_RETRIES: 4
+      SYZM_TIMEZONE: America/New_York
+    ports:
+      - "8080:8080"
+
+  portal:
+    image: node:22-alpine
+    container_name: syzm-portal
+    working_dir: /app
+    command: sh -c "npm install && npm run dev"
+    volumes:
+      - ../portal:/app
+    ports:
+      - "3000:3000"
+    depends_on:
+      - brain
+
+volumes:
+  pgdata:
+

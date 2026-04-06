@@ -1,0 +1,82 @@
+openapi: 3.1.0
+info:
+  title: Syzm Brain API
+  version: 0.1.0
+servers:
+  - url: http://localhost:8080
+paths:
+  /healthz:
+    get:
+      summary: Health check
+      responses:
+        "200":
+          description: Service health
+  /v1/schedule:
+    post:
+      summary: Compute optimal retry schedule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ScheduleRequest"
+      responses:
+        "200":
+          description: Schedule generated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ScheduleResponse"
+        "422":
+          description: Retry candidate exhausted
+components:
+  schemas:
+    ScheduleRequest:
+      type: object
+      required:
+        - invoice_id
+      properties:
+        invoice_id:
+          type: string
+        decline_code:
+          type: string
+          nullable: true
+        bank_bin:
+          type: string
+          nullable: true
+        region:
+          type: string
+        retry_count:
+          type: integer
+        original_amount_cents:
+          type: integer
+        processor_origin:
+          type: string
+          enum: [stripe, adyen, braintree]
+        processor_history:
+          type: array
+          items:
+            type: string
+            enum: [stripe, adyen, braintree]
+    ScheduleResponse:
+      type: object
+      required:
+        - invoice_id
+        - scheduled_at_utc
+        - reason
+      properties:
+        invoice_id:
+          type: string
+        scheduled_at_utc:
+          type: string
+          format: date-time
+        reason:
+          type: string
+        strategy_version:
+          type: string
+        eligible_processors:
+          type: array
+          items:
+            type: string
+            enum: [stripe, adyen, braintree]
+
