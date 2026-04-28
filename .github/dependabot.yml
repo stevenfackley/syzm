@@ -1,0 +1,63 @@
+# Dependabot config for syzm.
+# Ecosystems: pip (src/brain/requirements.txt),
+#             npm (src/portal/package.json),
+#             docker (src/brain/Dockerfile).
+# Policy: minor/patch grouped weekly; majors separate so each gets an ADR
+# stub before merge (per dependabot-sweep-policy memory).
+version: 2
+updates:
+
+  - package-ecosystem: "pip"
+    directory: "/src/brain"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "America/New_York"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "python"
+    commit-message:
+      prefix: "deps(brain)"
+      include: "scope"
+    groups:
+      python-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "npm"
+    directory: "/src/portal"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "America/New_York"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "javascript"
+    commit-message:
+      prefix: "deps(portal)"
+      include: "scope"
+    groups:
+      portal-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "docker"
+    directory: "/src/brain"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "America/New_York"
+    labels:
+      - "dependencies"
+      - "docker"
+    commit-message:
+      prefix: "deps(docker/brain)"
