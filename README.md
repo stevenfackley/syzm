@@ -1,4 +1,4 @@
-# SYZM
+# SYZM <sub>`>o)`</sub>
 
 ML-driven payment recovery platform for streaming businesses.  
 Syzm ingests soft declines from processors, predicts the best retry window, and executes retries across gateway routes while enforcing 2026 compliance constraints.
