@@ -1,0 +1,34 @@
+[tasks.brain-dev]
+run = "uvicorn app.main:app --reload --host 0.0.0.0 --port 8080"
+dir = "src/brain"
+
+[tasks.brain-test]
+run = "pytest tests/"
+dir = "src/brain"
+
+[tasks.portal-dev]
+run = "npm run dev"
+dir = "src/portal"
+
+[tasks.portal-build]
+run = "npm run build"
+dir = "src/portal"
+
+[tasks.portal-start]
+run = "npm run start"
+dir = "src/portal"
+
+[tasks.portal-lint]
+run = "npm run lint"
+dir = "src/portal"
+
+[tasks.infra-up]
+run = "docker compose up"
+dir = "src/infra"
+
+[tasks.infra-down]
+run = "docker compose down"
+dir = "src/infra"
+
+[env]
+# non-secret config
