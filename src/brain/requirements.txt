@@ -4,6 +4,6 @@ pydantic==2.13.4
 pydantic-settings==2.14.1
 xgboost==3.2.0
 numpy==2.4.6
-python-multipart==0.0.30
+python-multipart==0.0.31
 pytest==9.0.3
 
