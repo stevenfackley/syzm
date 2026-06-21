@@ -3,8 +3,6 @@
 import { motion } from "motion/react";
 import { revealChild, RevealGroup } from "@/components/Reveal";
 
-const EASE = [0.16, 1, 0.3, 1] as const;
-
 // Re-export so the parent doesn't need to import from motion/react
 export { revealChild };
 
