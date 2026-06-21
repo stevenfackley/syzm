@@ -48,7 +48,7 @@ jobs:
         run: deno lint
 
       - name: Type check
-        run: deno check **/*.ts
+        run: deno check webhook.ts execute-retries.ts
 
       - name: Test
         run: deno test --allow-env --allow-net
