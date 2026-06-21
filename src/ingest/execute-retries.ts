@@ -63,7 +63,7 @@ serve(async (req: Request) => {
       return json({ error: "due_fetch_error" }, 500);
     }
 
-    const rows = (data ?? []) as QueueRow[];
+    const rows = (data ?? []) as unknown as QueueRow[];
     let recovered = 0;
     let rescheduled = 0;
     let exhausted = 0;
