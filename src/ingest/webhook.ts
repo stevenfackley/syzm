@@ -138,12 +138,17 @@ function getProcessorFromPath(url: string): ProcessorName {
 
 // ─── Normalization ───────────────────────────────────────────────────────────
 
+// Webhook payloads are loosely shaped per processor; a permissive record keeps
+// the field-coalescing below readable.
+// deno-lint-ignore no-explicit-any
+type LooseRecord = Record<string, any>;
+
 function normalizeDecline(
   processor: ProcessorName,
   payload: Record<string, unknown>,
   correlationId: string,
 ): NormalizedDecline {
-  const p = payload as Record<string, any>;
+  const p = payload as LooseRecord;
   const obj = p.data?.object ?? {};
 
   const invoiceId = String(
@@ -197,8 +202,8 @@ function normalizeDecline(
 
 function extractProcessorEventId(
   processor: ProcessorName,
-  p: Record<string, any>,
-  obj: Record<string, any>,
+  p: LooseRecord,
+  _obj: LooseRecord,
   correlationId: string,
 ): string {
   switch (processor) {
