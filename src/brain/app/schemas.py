@@ -1,10 +1,25 @@
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
 
 ProcessorName = Literal["stripe", "adyen", "braintree"]
+
+# Canonical decline categories — shared vocabulary across Brain, Portal, and
+# any downstream agents.  Map raw processor decline codes to these before
+# calling /v1/audit/estimate.
+DeclineCategory = Literal[
+    "insufficient_funds",
+    "do_not_honor",
+    "transient",
+    "velocity",
+    "expired_card",
+    "invalid_data",
+    "fraud",
+    "authentication",
+    "unknown",
+]
 
 
 class ScheduleRequest(BaseModel):
@@ -37,14 +52,39 @@ class ScheduleResponse(BaseModel):
     eligible_processors: list[ProcessorName]
 
 
+class SegmentBreakdownItem(BaseModel):
+    """Per-category breakdown returned in AuditEstimateResponse."""
+    category: str
+    amount_cents: int
+    recovery_rate: float
+    recoverable_cents: int
+    do_not_retry: bool
+    description: str
+
+
 class AuditEstimateRequest(BaseModel):
     failed_transactions: int = Field(ge=0)
     failed_amount_cents: int = Field(ge=0)
     region: str = Field(default="US")
+    # Optional segmented breakdown; keys must be DeclineCategory values.
+    # If omitted, the engine applies the documented default decline mix.
+    breakdown_by_category: dict[str, Annotated[int, Field(ge=0)]] | None = None
 
 
 class AuditEstimateResponse(BaseModel):
+    # --- fields already consumed by the portal (backward-compatible) ---
     recoverable_monthly_cents: int
     churn_reduction_percent: float
     confidence_band: str
+    # --- new segmented fields ---
+    recoverable_amount_cents: int
+    blended_recovery_rate: float
+    confidence_low_cents: int
+    confidence_high_cents: int
+    segments: list[SegmentBreakdownItem] = Field(default_factory=list)
+    used_default_mix: bool = False
+    disclaimer: str = (
+        "Recovery rates are industry-informed estimates, NOT guarantees. "
+        "Actual recovery depends on merchant category, issuer, retry timing, and card mix."
+    )
 

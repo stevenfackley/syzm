@@ -1,19 +1,56 @@
 openapi: 3.1.0
 info:
   title: Syzm Brain API
-  version: 0.1.0
+  version: 0.2.0
+  description: |
+    ML-powered payment-retry scheduler and audit estimator.
+
+    **Authentication**: all mutating / scoring endpoints require the
+    ``X-Syzm-Key`` header.  Set ``SYZM_BRAIN_API_KEY`` in the service
+    environment.  The ``/healthz`` and ``/v1/compliance`` endpoints are
+    intentionally unauthenticated.
+
+    **Correlation**: every response echoes an ``X-Request-Id`` header.
+    Supply one in the request to trace end-to-end; if absent the service
+    generates a UUID.
+
+    **Rate estimates disclaimer**: all recovery-rate figures are
+    industry-informed estimates, not contractual guarantees.
 servers:
   - url: http://localhost:8080
+
+security:
+  - ApiKeyAuth: []
+
 paths:
   /healthz:
     get:
       summary: Health check
+      security: []   # unauthenticated
       responses:
         "200":
           description: Service health
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  model_loaded:
+                    type: boolean
+                  strategy_version:
+                    type: string
+
   /v1/schedule:
     post:
       summary: Compute optimal retry schedule
+      parameters:
+        - $ref: "#/components/parameters/RequestIdHeader"
       requestBody:
         required: true
         content:
@@ -23,13 +60,98 @@ paths:
       responses:
         "200":
           description: Schedule generated
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ScheduleResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "422":
           description: Retry candidate exhausted
+
+  /v1/audit/estimate:
+    post:
+      summary: Estimate recoverable revenue from failed payments
+      description: |
+        Returns a segmented recovery estimate broken down by decline category.
+        If ``breakdown_by_category`` is omitted the engine applies a documented
+        default decline-mix to the total amount.  All rates are estimates.
+      parameters:
+        - $ref: "#/components/parameters/RequestIdHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AuditEstimateRequest"
+      responses:
+        "200":
+          description: Recovery estimate
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuditEstimateResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/compliance:
+    get:
+      summary: Compliance configuration (retry limits, blackout windows)
+      security: []   # read-only, no secrets
+      responses:
+        "200":
+          description: Compliance rules
+
 components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Syzm-Key
+      description: |
+        API key for protected endpoints.  Set ``SYZM_BRAIN_API_KEY`` in the
+        service environment.  Missing or invalid key returns 401.
+
+  headers:
+    RequestId:
+      description: Correlation ID — echoed from request X-Request-Id or generated as UUID.
+      schema:
+        type: string
+        example: 550e8400-e29b-41d4-a716-446655440000
+
+  parameters:
+    RequestIdHeader:
+      in: header
+      name: X-Request-Id
+      required: false
+      schema:
+        type: string
+      description: Optional caller-supplied correlation ID; echoed in response.
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid X-Syzm-Key header
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              detail:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: unauthorized
+                  hint:
+                    type: string
+                    example: Supply a valid X-Syzm-Key header.
+
   schemas:
     ScheduleRequest:
       type: object
@@ -46,18 +168,23 @@ components:
           nullable: true
         region:
           type: string
+          default: US
         retry_count:
           type: integer
+          default: 0
         original_amount_cents:
           type: integer
+          default: 0
         processor_origin:
           type: string
           enum: [stripe, adyen, braintree]
+          default: stripe
         processor_history:
           type: array
           items:
             type: string
             enum: [stripe, adyen, braintree]
+
     ScheduleResponse:
       type: object
       required:
@@ -80,3 +207,92 @@ components:
             type: string
             enum: [stripe, adyen, braintree]
 
+    AuditEstimateRequest:
+      type: object
+      required:
+        - failed_transactions
+        - failed_amount_cents
+      properties:
+        failed_transactions:
+          type: integer
+          minimum: 0
+        failed_amount_cents:
+          type: integer
+          minimum: 0
+        region:
+          type: string
+          default: US
+        breakdown_by_category:
+          type: object
+          description: |
+            Optional map of {decline_category: amount_cents}.
+            Valid keys: insufficient_funds, do_not_honor, transient, velocity,
+            expired_card, invalid_data, fraud, authentication, unknown.
+            If omitted, the default industry decline-mix is applied.
+          additionalProperties:
+            type: integer
+            minimum: 0
+          nullable: true
+
+    SegmentBreakdownItem:
+      type: object
+      properties:
+        category:
+          type: string
+        amount_cents:
+          type: integer
+        recovery_rate:
+          type: number
+          description: Estimated recovery rate 0–1 (e.g. 0.35 = 35%)
+        recoverable_cents:
+          type: integer
+        do_not_retry:
+          type: boolean
+          description: True for fraud/lost/stolen — callers MUST NOT schedule retries.
+        description:
+          type: string
+
+    AuditEstimateResponse:
+      type: object
+      required:
+        - recoverable_monthly_cents
+        - churn_reduction_percent
+        - confidence_band
+        - recoverable_amount_cents
+        - blended_recovery_rate
+        - confidence_low_cents
+        - confidence_high_cents
+        - segments
+      properties:
+        # --- backward-compatible fields (already consumed by portal) ---
+        recoverable_monthly_cents:
+          type: integer
+          description: Alias for recoverable_amount_cents; kept for portal backward-compat.
+        churn_reduction_percent:
+          type: number
+        confidence_band:
+          type: string
+          enum: [low, medium, high]
+        # --- new segmented fields ---
+        recoverable_amount_cents:
+          type: integer
+          description: Total estimated recoverable amount across all segments.
+        blended_recovery_rate:
+          type: number
+          description: Weighted average recovery rate 0–1.
+        confidence_low_cents:
+          type: integer
+          description: Lower bound of the +/-20% confidence band.
+        confidence_high_cents:
+          type: integer
+          description: Upper bound of the +/-20% confidence band.
+        segments:
+          type: array
+          items:
+            $ref: "#/components/schemas/SegmentBreakdownItem"
+        used_default_mix:
+          type: boolean
+          description: True when the default industry decline-mix was applied.
+        disclaimer:
+          type: string
+          description: Mandatory disclosure that rates are estimates, not guarantees.

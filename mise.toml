@@ -22,6 +22,13 @@ dir = "src/portal"
 run = "npm run lint"
 dir = "src/portal"
 
+[tasks.ingest-test]
+run = "deno test --allow-env --allow-net"
+dir = "src/ingest"
+
+[tasks.ci]
+run = "mise run brain-test && mise run ingest-test && mise run portal-lint && mise run portal-build"
+
 [tasks.infra-up]
 run = "docker compose up"
 dir = "src/infra"
