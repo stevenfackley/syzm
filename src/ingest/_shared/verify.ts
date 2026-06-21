@@ -35,11 +35,11 @@ export async function verifySignature(
 ): Promise<void> {
   switch (processor) {
     case "stripe":
-      return verifyStripe(rawBody, headers, secrets.stripeWebhookSecret);
+      return await verifyStripe(rawBody, headers, secrets.stripeWebhookSecret);
     case "adyen":
-      return verifyAdyen(rawBody, headers, secrets.adyenHmacKey);
+      return await verifyAdyen(rawBody, headers, secrets.adyenHmacKey);
     case "braintree":
-      return verifyBraintree(
+      return await verifyBraintree(
         rawBody,
         headers,
         secrets.braintreePublicKey,
@@ -272,7 +272,7 @@ async function verifyBraintree(
 
 async function importHmacKey(secret: string): Promise<CryptoKey> {
   const bytes = encoder.encode(secret);
-  return crypto.subtle.importKey(
+  return await crypto.subtle.importKey(
     "raw",
     bytes.buffer as ArrayBuffer,
     { name: "HMAC", hash: "SHA-256" },
