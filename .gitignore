@@ -8,6 +8,8 @@ __pycache__/
 node_modules/
 .next/
 npm-debug.log*
+*.tsbuildinfo
+next-env.d.ts
 
 # Env and secrets
 .env
@@ -18,4 +20,10 @@ npm-debug.log*
 dist/
 coverage/
 tmp/
+*.build.log
+.build.log
+
+# Throwaway design comps + tool scratch
+.design/
+.playwright-mcp/
 

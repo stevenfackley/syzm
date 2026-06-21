@@ -3,9 +3,19 @@
   "$id": "https://syzm.ai/schemas/recovery-event.schema.json",
   "title": "Syzm Recovery Event",
   "type": "object",
-  "required": ["invoice_id", "region", "original_amount_cents", "processor_origin"],
+  "required": ["invoice_id", "region", "original_amount_cents", "processor_origin", "processor_event_id", "tenant_id"],
   "properties": {
     "invoice_id": { "type": "string", "minLength": 1 },
+    "processor_event_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Upstream webhook event id (e.g. Stripe evt_xxx). Used as the idempotency key — ingest upserts ON CONFLICT (processor_event_id) DO NOTHING."
+    },
+    "tenant_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Tenant identifier. Must match the JWT claim or app.tenant_id GUC used for RLS."
+    },
     "decline_code": { "type": ["string", "null"] },
     "bank_bin": { "type": ["string", "null"], "pattern": "^\\d{6,8}$" },
     "region": { "type": "string", "minLength": 2, "maxLength": 16 },

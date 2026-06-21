@@ -32,6 +32,7 @@ class RetryScheduler:
         self,
         payload: ScheduleRequest,
         now_utc: datetime | None = None,
+        request_id: str = "-",
     ) -> RetryScheduleResult:
         if payload.retry_count >= settings.max_retries:
             raise RetryExhaustedError("retry_count must be < 4")
@@ -40,7 +41,12 @@ class RetryScheduler:
         if now.tzinfo is None:
             now = now.replace(tzinfo=UTC)
 
-        delay_minutes = self.model.score_delay_minutes(payload)
+        import inspect as _inspect
+        _sig = _inspect.signature(self.model.score_delay_minutes)
+        if "request_id" in _sig.parameters:
+            delay_minutes = self.model.score_delay_minutes(payload, request_id=request_id)
+        else:
+            delay_minutes = self.model.score_delay_minutes(payload)
         candidate = now + timedelta(minutes=delay_minutes)
         candidate = self._shift_outside_maintenance(candidate)
         candidate = candidate.replace(second=0, microsecond=0)
