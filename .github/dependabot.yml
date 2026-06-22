@@ -42,6 +42,15 @@ updates:
     commit-message:
       prefix: "deps(portal)"
       include: "scope"
+    ignore:
+      # eslint 10 is unsupported by the Next lint stack: eslint-plugin-react
+      # (bundled via eslint-config-next 16.2.9) declares peer eslint ^9.7 and has
+      # no v10 release — it calls the removed `getFilename` API and crashes the
+      # lint run. There is no newer eslint-config-next to upgrade into. Drop this
+      # block once eslint-config-next / eslint-plugin-react ship eslint 10 support.
+      # See Dependabot #32.
+      - dependency-name: "eslint"
+        versions: [">=10.0.0"]
     groups:
       portal-minor-and-patch:
         applies-to: version-updates
