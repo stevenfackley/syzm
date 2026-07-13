@@ -1,7 +1,12 @@
 name: dependabot-auto-merge
 
-# Auto-approves and enables auto-merge on Dependabot PRs that are PATCH bumps
-# only. Minor/major bumps still require human review.
+# Enables auto-merge on Dependabot PRs that are PATCH bumps only.
+# Minor/major bumps still require human review.
+#
+# main has no required PR reviews, so no self-approval is needed — auto-merge
+# fires once the required status checks pass. (The old `gh pr review --approve`
+# step failed under "GitHub Actions is not permitted to approve pull requests"
+# and was unnecessary; removed rather than enabling Actions PR-approval.)
 #
 # Requirements:
 #   * Repo Settings -> General -> "Allow auto-merge" must be ON.
@@ -28,11 +33,10 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Approve and enable auto-merge for patch bumps
+      - name: Enable auto-merge for patch bumps
         if: ${{ steps.meta.outputs.update-type == 'version-update:semver-patch' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_URL: ${{ github.event.pull_request.html_url }}
         run: |
-          gh pr review --approve "$PR_URL"
           gh pr merge --auto --squash "$PR_URL"
