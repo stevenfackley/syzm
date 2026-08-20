@@ -35,3 +35,12 @@ ADR log. Append-only.
   - `eslint-config-next 16` aligns with ESLint 10 plugin protocol.
 - **@types/node 22 → 25** (PR #4): pure types; build-only.
 **Why no review:** dormant repo, no prod traffic, reverts free.
+
+## 2026-08-19 — Dependabot sweep: terraform hashicorp/aws ~>5.75 → ~>6.60
+
+**Status:** accepted (awareness-only stub per saved sweep policy)
+**Decision:** merged #70 on green CI.
+- Provider v6 removes long-deprecated arguments and changes default_tags interactions. The next `terraform plan` under src/infra/terraform/aws is the real gate — read the diff before applying.
+- motion 12 → 13 (/src/portal, #69) follows after rebase — v13 renames some spring/transition options; portal CI is the check.
+
+**Why no review:** sweep policy — CI gates, revert cheap; plan/apply stays manual.
