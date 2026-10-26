@@ -44,3 +44,12 @@ ADR log. Append-only.
 - motion 12 → 13 (/src/portal, #69) follows after rebase — v13 renames some spring/transition options; portal CI is the check.
 
 **Why no review:** sweep policy — CI gates, revert cheap; plan/apply stays manual.
+
+## 2026-10-26 — Dependabot sweep: motion 13 -> 14 (/src/portal), python minor group (/src/brain)
+
+**Status:** accepted (awareness-only stub per saved sweep policy)
+**Decision:** merged #100 and #98 on green CI.
+- motion 13.4 -> 14.6 (#100): 14.0.0's only change removes internal APIs that 13.5.1 had restored for cross-compatibility with framer-motion 13.0 to 13.4. The portal uses only the public surface (`motion.div`, `HTMLMotionProps`, `initial`/`whileInView`/`viewport`/`transition`), and motion, framer-motion, motion-dom and motion-utils all resolve to 14.6.0 together, so no mixed-version internals exist in the tree.
+- fastapi 0.143 -> 0.161 and pydantic-settings patch (#98): 0.x "minor" bumps can break; brain CI is the check and passed.
+
+**Why no review:** sweep policy — CI gates, revert cheap.
