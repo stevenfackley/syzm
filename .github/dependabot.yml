@@ -2,7 +2,7 @@
 # Ecosystems: pip (src/brain/requirements.txt),
 #             npm (src/portal/package.json),
 #             docker (src/brain/Dockerfile).
-# Policy: minor/patch grouped weekly; majors separate so each gets an ADR
+# Policy: monthly, limit 3, minor/patch grouped; majors separate so each gets an ADR
 # stub before merge (per dependabot-sweep-policy memory).
 version: 2
 updates:
@@ -10,11 +10,10 @@ updates:
   - package-ecosystem: "pip"
     directory: "/src/brain"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "monthly"
       time: "06:00"
       timezone: "America/New_York"
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 3
     labels:
       - "dependencies"
       - "python"
@@ -31,11 +30,10 @@ updates:
   - package-ecosystem: "npm"
     directory: "/src/portal"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "monthly"
       time: "06:00"
       timezone: "America/New_York"
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 3
     labels:
       - "dependencies"
       - "javascript"
@@ -66,40 +64,50 @@ updates:
   - package-ecosystem: "docker"
     directory: "/src/brain"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "monthly"
       time: "06:00"
       timezone: "America/New_York"
+    open-pull-requests-limit: 3
     labels:
       - "dependencies"
       - "docker"
     commit-message:
       prefix: "deps(docker/brain)"
+    groups:
+      docker-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
 
   # ── Added by the project-wide Dependabot sweep ──────────────────────────
   # Ecosystems present in the repo that no existing entry covered.
   - package-ecosystem: "terraform"
     directory: "/src/infra/terraform/aws"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "monthly"
       time: "06:00"
       timezone: "America/New_York"
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 3
     labels:
       - "dependencies"
       - "terraform"
     commit-message:
       prefix: "deps(terraform)"
+    groups:
+      terraform-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
 
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "monthly"
       time: "06:00"
       timezone: "America/New_York"
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 3
     labels:
       - "dependencies"
       - "ci"
