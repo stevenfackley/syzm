@@ -45,14 +45,11 @@ Open `http://localhost:3000`.
 
 ## 3) SQL Bootstrap
 
-Run in order:
-
-1. `src/sql/001_init.sql`
-2. `src/sql/002_cron.sql`
+Apply `src/sql/001` through `src/sql/007` in order. See [`src/sql/README.md`](src/sql/README.md) for details: `002_cron.sql` holds placeholder literals and is superseded by `005_cron_parameterized.sql`, which needs the Vault secrets registered first.
 
 ## Configuration
 
-Copy `.env.example` to `.env` and update secrets.
+Copy `.env.example` to `.env` and update secrets. `.env.example` is the authoritative list.
 
 Required values:
 
@@ -62,6 +59,9 @@ Required values:
 - `SYZM_STRIPE_API_KEY`
 - `SYZM_ADYEN_API_KEY`
 - `SYZM_BRAINTREE_API_KEY`
+- `SYZM_BRAIN_API_KEY` (Brain scoring API auth, sent as `X-Syzm-Key`)
+- Webhook verification: `SYZM_STRIPE_WEBHOOK_SECRET`, `SYZM_ADYEN_HMAC_KEY`, `SYZM_ADYEN_MERCHANT_ACCOUNT`, `SYZM_BRAINTREE_PUBLIC_KEY`, `SYZM_BRAINTREE_PRIVATE_KEY`, `SYZM_BRAINTREE_MERCHANT_ID`
+- Portal: `NEXT_PUBLIC_SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`
 
 ## Project Layout
 
@@ -86,6 +86,6 @@ syzm/
 ## Production Notes
 
 - This scaffold is intentionally implementation-ready but not production-complete.
-- Signature verification for processor webhooks is left as a marked TODO in `src/ingest/webhook.ts`.
-- Processor retry calls in `src/ingest/_shared/processors.ts` are stubs and should be swapped for official SDK calls.
+- Webhook signature verification is implemented in `src/ingest/_shared/verify.ts` (Stripe signatures carry a timestamp tolerance for replay protection); `src/ingest/webhook.ts` returns 401 on a failed check.
+- Processor retry calls in `src/ingest/_shared/processors.ts` call the live REST APIs directly. Adyen (`checkout-test.adyen.com`) and Braintree (sandbox GraphQL) still point at test/sandbox endpoints, and Braintree carries a TODO to move to the official SDK.
 

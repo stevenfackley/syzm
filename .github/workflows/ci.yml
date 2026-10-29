@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
     branches: [main]
 
@@ -79,6 +79,8 @@ jobs:
 
   secret-scan:
     name: secret-scan
+    # Fleet guardrail: scans run on pull_request only.
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

@@ -5,7 +5,7 @@
 1. Processor webhooks -> Supabase Edge ingress (`src/ingest/webhook.ts`)
 2. Ingress normalizes event + calls Brain (`src/brain/app/main.py`) for retry timestamp
 3. Queue entry written to Postgres (`src/sql/001_init.sql`)
-4. `pg_cron` triggers execution loop (`src/sql/002_cron.sql`)
+4. `pg_cron` triggers execution loop (`src/sql/005_cron_parameterized.sql`)
 5. Execution loop processes due retries and updates status
 6. Metrics and audit runs power dashboard and sales workflows
 
