@@ -10,6 +10,7 @@ Apply in order.  Each migration is idempotent (uses `IF NOT EXISTS`, `ON CONFLIC
 | 4 | `004_multitenancy_rls.sql` | `tenant_id` on queue, generated `tenant_id` on metrics, RLS policies |
 | 5 | `005_cron_parameterized.sql` | Replaces the 002 placeholder job; reads URL + key from Vault |
 | 6 | `006_dashboard_views.sql` | `syzm_dashboard_metrics` + `syzm_decline_intelligence` views |
+| 7 | `007_reconcile_ingest_columns.sql` | `payment_token` + normalized `decline_category` columns used by ingest |
 
 ---
 
