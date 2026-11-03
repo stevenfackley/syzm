@@ -63,3 +63,14 @@ ADR log. Append-only.
 - fastapi 0.161.1 -> 0.162.0 (#106): its one breaking change (omitted boolean form fields) only reaches `Form()` parameters; the brain declares none.
 
 **Why no review:** sweep policy — CI gates, revert cheap.
+
+## 2026-11-03 — Dependabot sweep wave 2: unscoped minimatch 11 override (/src/portal)
+
+**Status:** accepted (awareness-only stub per saved sweep policy)
+**Decision:** replace `"minimatch@10": "^11.0.1"` with the unscoped `"minimatch": "^11.0.4"` in the portal `overrides`.
+- The 2026-11-02 entry misread the alert's scope: GHSA-g3hv-75wg-m249 covers `< 11.0.1`, so Dependabot kept flagging the lock's 3.1.5 copies (eslint, @eslint/config-array, @eslint/eslintrc, and eslint-config-next's nested eslint-plugin-import / -jsx-a11y / -react) and alert #58 stayed open after #108. Every chain now resolves to 11.0.4 (`npm ls minimatch --all --package-lock-only`).
+- 11.0.4 is dual CJS/ESM (`exports["."].require` -> `dist/commonjs`), so `require("minimatch")` returns `{ minimatch, Minimatch, ... }`: no `default`, and the module object is not callable. Consumers that take `Minimatch` by property survive (eslint `lib/eslint/eslint-helpers.js`, `@eslint/config-array`, `@eslint/eslintrc`, `import/no-restricted-paths`); typescript-estree uses the named `minimatch`. `npm run lint` and `npm run build` pass (Node 26 locally; CI runs 22).
+- Caveat: rules that call the module object as a function (or `makeRe()`, removed in 11.0) would throw a TypeError at rule run time if ever enabled: eslint-plugin-react `forbid-component-props`, `jsx-handler-names`, `jsx-pascal-case`, `no-danger`, `no-unstable-nested-components` (`minimatch(...)`); eslint-plugin-jsx-a11y `control-has-associated-label`, `label-has-associated-control` (via `mayHaveAccessibleLabel` / `mayContainChildComponent`, babel `_interopRequireDefault(...)["default"](...)`); eslint-plugin-import `extensions`, `no-extraneous-dependencies`, `no-import-module-exports`, `no-internal-modules`, `no-namespace`, `no-unassigned-import`, `order`. eslint-config-next 16.4.3 enables none of them (explicit rules + react / react-hooks / @next `recommended`). Enabling one means scoping the override back to the chains that work and accepting the alert on the rest.
+- Drop the override once eslint-plugin-react / -jsx-a11y / -import and @eslint/* ship releases that declare minimatch >= 11.
+
+**Why no review:** sweep policy — CI gates, revert cheap; `npm run lint` exercises every consumer.
