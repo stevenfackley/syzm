@@ -53,3 +53,13 @@ ADR log. Append-only.
 - fastapi 0.143 -> 0.161 and pydantic-settings patch (#98): 0.x "minor" bumps can break; brain CI is the check and passed.
 
 **Why no review:** sweep policy — CI gates, revert cheap.
+
+## 2026-11-02 — Dependabot sweep: brain python group + python:3.15-slim, portal group, minimatch 10 -> 11 override (/src/portal)
+
+**Status:** accepted (awareness-only stub per saved sweep policy)
+**Decision:** squash-merged #105, #106 and #107 on green CI; the follow-up PR adds `"minimatch@10": "^11.0.1"` to the portal `overrides` for GHSA-g3hv-75wg-m249.
+- minimatch 10.2.5 -> 11.0.4 (dev-only, transitive via `@typescript-eslint/typescript-estree` `^10.2.2`, which no release widens yet). The alert pins only the 10.2.5 copy: the amplified `firstPhasePreProcess()` path is v7+ code, so the four eslint-side 3.1.5 copies stay as they are. 11.0 removes `makeRe()`, `Minimatch#regexp`, the `AST` class, `matchOne()`, `slashSplit()` and the `debug` option, drops Node 18 (`engines: 20 || >=22`; CI runs 22) and adds `@isaacs/nonrecursive-glob-match`; typescript-estree 8.61.1 only calls `minimatch(filePath, pattern, { dot: true })` (`dist/useProgramFromProjectService.js`). `npm run lint` is the gate; drop the override once typescript-estree requires `^11`.
+- python:3.14-slim -> 3.15-slim (#105): CI tests on 3.12 and never builds the image, so the base-image bump is unexercised by CI. Every compiled dependency in requirements.txt ships cp315 or abi3 wheels (numpy 2.5.4, pydantic-core 2.50.1, uvloop, httptools, watchfiles), so `pip install` in the slim image needs no compiler.
+- fastapi 0.161.1 -> 0.162.0 (#106): its one breaking change (omitted boolean form fields) only reaches `Form()` parameters; the brain declares none.
+
+**Why no review:** sweep policy — CI gates, revert cheap.
