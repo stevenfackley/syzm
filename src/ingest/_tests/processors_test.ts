@@ -45,6 +45,53 @@ function makeFetchMock(
   }) as typeof fetch;
 }
 
+/** A gateway or proxy error page: not JSON. */
+function makeHtmlFetchMock(status: number): typeof fetch {
+  return (async () =>
+    new Response("<html><body>502 Bad Gateway</body></html>", {
+      status,
+      headers: { "content-type": "text/html" },
+    })) as typeof fetch;
+}
+
+// ─── Non-JSON responses (one bad row must not throw and end the batch) ───────
+
+Deno.test("Stripe: non-JSON error page returns transient instead of throwing", async () => {
+  const result = await retryPayment("stripe", attempt, creds, "corr-html-1", makeHtmlFetchMock(502));
+
+  assertEquals(result.ok, false);
+  assertEquals(result.declineCategory, "transient");
+  assertEquals(result.rawDeclineCode, "http_502");
+});
+
+Deno.test("Adyen: non-JSON error page returns transient instead of throwing", async () => {
+  const result = await retryPayment(
+    "adyen",
+    { invoiceId: "inv_adyen_html", amountCents: 2500, paymentToken: "shopper123|detail456" },
+    creds,
+    "corr-html-2",
+    makeHtmlFetchMock(502),
+  );
+
+  assertEquals(result.ok, false);
+  assertEquals(result.declineCategory, "transient");
+  assertEquals(result.rawDeclineCode, "http_502");
+});
+
+Deno.test("Braintree: non-JSON error page returns transient instead of throwing", async () => {
+  const btHtmlAttempt = { invoiceId: "inv_bt_html", amountCents: 3000, paymentToken: "pmt_abc" };
+
+  const on502 = await retryPayment("braintree", btHtmlAttempt, creds, "corr-html-3", makeHtmlFetchMock(502));
+  assertEquals(on502.ok, false);
+  assertEquals(on502.declineCategory, "transient");
+  assertEquals(on502.rawDeclineCode, "http_502");
+
+  const on200 = await retryPayment("braintree", btHtmlAttempt, creds, "corr-html-4", makeHtmlFetchMock(200));
+  assertEquals(on200.ok, false);
+  assertEquals(on200.declineCategory, "transient");
+  assertEquals(on200.rawDeclineCode, "http_200");
+});
+
 // ─── Stripe tests ─────────────────────────────────────────────────────────────
 
 Deno.test("Stripe: approved PaymentIntent returns ok=true", async () => {

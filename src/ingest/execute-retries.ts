@@ -2,7 +2,7 @@ import { serve } from "@std/http";
 import { createClient } from "@supabase/supabase-js";
 
 import { readEnv } from "./_shared/config.ts";
-import { retryPayment, type ProcessorCredentials } from "./_shared/processors.ts";
+import { retryPayment, type ProcessorCredentials, type RetryResult } from "./_shared/processors.ts";
 import { checkRetryGuards, describeViolation } from "./_shared/guards.ts";
 import type {
   BrainScheduleRequest,
@@ -69,6 +69,7 @@ serve(async (req: Request) => {
     let rescheduled = 0;
     let exhausted = 0;
     let guarded = 0;
+    let errored = 0;
 
     for (const row of rows) {
       const rowCorrelation = row.correlation_id ?? batchCorrelationId;
@@ -102,16 +103,29 @@ serve(async (req: Request) => {
       }
 
       const nextProcessor = pickNextProcessor(row.processor_origin, row.processor_history ?? []);
-      const result = await retryPayment(
-        nextProcessor,
-        {
-          invoiceId: row.invoice_id,
-          amountCents: row.original_amount_cents,
-          paymentToken: row.payment_token,
-        },
-        processorCreds,
-        rowCorrelation,
-      );
+      let result: RetryResult;
+      try {
+        result = await retryPayment(
+          nextProcessor,
+          {
+            invoiceId: row.invoice_id,
+            amountCents: row.original_amount_cents,
+            paymentToken: row.payment_token,
+          },
+          processorCreds,
+          rowCorrelation,
+        );
+      } catch (err) {
+        // A network error has no known outcome. Leave the row untouched (still
+        // pending, same processor next run) and go on with the rest of the batch.
+        errored += 1;
+        rowLog("error", "retry_attempt_error", {
+          invoice_id: row.invoice_id,
+          processor: nextProcessor,
+          message: err instanceof Error ? err.message : String(err),
+        });
+        continue;
+      }
 
       const history = [...(row.processor_history ?? []), nextProcessor];
       const newRetryCount = row.retry_count + 1;
@@ -192,9 +206,9 @@ serve(async (req: Request) => {
         .eq("id", row.id);
     }
 
-    log("info", "batch_complete", { processed: rows.length, recovered, rescheduled, exhausted, guarded });
+    log("info", "batch_complete", { processed: rows.length, recovered, rescheduled, exhausted, guarded, errored });
 
-    return json({ processed: rows.length, recovered, rescheduled, exhausted, guarded });
+    return json({ processed: rows.length, recovered, rescheduled, exhausted, guarded, errored });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(
