@@ -2,6 +2,8 @@ import { serve } from "@std/http";
 import { createClient } from "@supabase/supabase-js";
 
 import { readEnv } from "./_shared/config.ts";
+import { type AdyenDecline, readAdyenDecline } from "./_shared/normalize.ts";
+import { mapAdyenRefusalReason } from "./_shared/processors.ts";
 import {
   SignatureVerificationError,
   verifySignature,
@@ -150,11 +152,13 @@ function normalizeDecline(
 ): NormalizedDecline {
   const p = payload as LooseRecord;
   const obj = p.data?.object ?? {};
+  const adyen: AdyenDecline = processor === "adyen" ? readAdyenDecline(p) : {};
 
   const invoiceId = String(
     p.invoice_id ??
       p.invoiceId ??
       obj.invoice ??
+      adyen.merchantReference ??
       `unknown_${correlationId}`,
   );
 
@@ -166,6 +170,7 @@ function normalizeDecline(
       p.declineCode ??
       obj.last_payment_error?.decline_code ??
       // Adyen
+      adyen.reason ??
       p.refusalReason ??
       "",
   ).toLowerCase();
@@ -174,6 +179,7 @@ function normalizeDecline(
     p.amount_cents ??
       p.amount ??
       obj.amount_due ??
+      adyen.amountMinorUnits ??
       0,
   );
 
@@ -225,6 +231,8 @@ function extractProcessorEventId(
 
 function mapRawCodeToCategory(processor: ProcessorName, rawCode: string): DeclineCategory {
   if (!rawCode) return "unknown";
+  // Adyen sends refusal text ("Not enough balance"), which the generic rules below miss.
+  if (processor === "adyen") return mapAdyenRefusalReason(rawCode, "");
   // Stripe-specific codes
   if (processor === "stripe") {
     if (["lost_card", "stolen_card"].includes(rawCode)) return "lost_stolen";

@@ -295,7 +295,7 @@ async function retryAdyen(
   };
 }
 
-function mapAdyenRefusalReason(refusalReason: string, resultCode: string): DeclineCategory {
+export function mapAdyenRefusalReason(refusalReason: string, resultCode: string): DeclineCategory {
   const r = refusalReason.toLowerCase();
   if (resultCode === "RedirectShopper" || r.includes("3d secure") || r.includes("authentication")) {
     return "authentication_required";
