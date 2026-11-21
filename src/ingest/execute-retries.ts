@@ -28,6 +28,7 @@ type QueueRow = {
   invoice_id: string;
   retry_count: number;
   original_amount_cents: number;
+  region: string;
   processor_origin: ProcessorName;
   processor_history: ProcessorName[] | null;
   status: string;
@@ -50,7 +51,7 @@ serve(async (req: Request) => {
     const { data, error } = await supabase
       .from("syzm_recovery_queue")
       .select(
-        "id, invoice_id, retry_count, original_amount_cents, processor_origin, " +
+        "id, invoice_id, retry_count, original_amount_cents, region, processor_origin, " +
           "processor_history, status, decline_category, payment_token, correlation_id",
       )
       .eq("status", "pending")
@@ -161,9 +162,11 @@ serve(async (req: Request) => {
       const nextSchedule = await getBrainScheduledAt(
         {
           invoice_id: row.invoice_id,
-          amount_cents: row.original_amount_cents,
+          decline_code: result.rawDeclineCode ?? null,
+          region: row.region,
           retry_count: newRetryCount,
-          last_decline_category: result.declineCategory,
+          original_amount_cents: row.original_amount_cents,
+          processor_origin: row.processor_origin,
           processor_history: history,
         },
         rowLog,

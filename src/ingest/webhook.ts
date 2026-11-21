@@ -258,9 +258,11 @@ async function requestBrainSchedule(
 ): Promise<BrainScheduleResponse> {
   const brainRequest: BrainScheduleRequest = {
     invoice_id: payload.invoice_id,
-    amount_cents: payload.original_amount_cents,
+    decline_code: payload.decline_code,
+    region: payload.region,
     retry_count: payload.retry_count,
-    last_decline_category: payload.decline_category,
+    original_amount_cents: payload.original_amount_cents,
+    processor_origin: payload.processor_origin,
     processor_history: payload.processor_history,
   };
 
