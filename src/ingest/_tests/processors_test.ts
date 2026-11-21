@@ -166,6 +166,17 @@ Deno.test("Stripe: expired_card maps correctly", async () => {
   assertEquals(result.declineCategory, "expired_card");
 });
 
+Deno.test("Stripe: processing PaymentIntent is not reported as a decline", async () => {
+  // The charge was accepted and is settling; a decline here would reschedule it
+  // onto another attempt while the first charge can still succeed.
+  const mockFetch = makeFetchMock({ id: "pi_processing", status: "processing" }, 200);
+
+  const result = await retryPayment("stripe", attempt, creds, "corr-processing", mockFetch);
+
+  assertEquals(result.ok, true);
+  assertEquals(result.processorReference, "pi_processing");
+});
+
 Deno.test("Stripe: requires_action maps to authentication_required", async () => {
   const mockFetch = makeFetchMock({ id: "pi_abc", status: "requires_action" }, 200);
 

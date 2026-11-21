@@ -182,7 +182,9 @@ async function retryStripe(
 
   if (resp.ok) {
     const status = json.status as string | undefined;
-    if (status === "succeeded") {
+    // "processing": Stripe accepted the charge and is still settling it, so it
+    // must not be retried. If it fails later Stripe sends a new payment_failed event.
+    if (status === "succeeded" || status === "processing") {
       return {
         ok: true,
         processor: "stripe",
