@@ -91,6 +91,29 @@ export async function retryPayment(
   return result;
 }
 
+/**
+ * Parse a processor response body. Returns null when the body is not a JSON
+ * object (e.g. an HTML error page from a gateway or proxy) so the caller can
+ * report a transient failure instead of throwing.
+ */
+async function readJsonBody(resp: Response): Promise<Record<string, unknown> | null> {
+  try {
+    const body = await resp.json();
+    return body && typeof body === "object" ? body as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
+}
+
+function nonJsonResult(processor: ProcessorName, resp: Response): RetryResult {
+  return {
+    ok: false,
+    processor,
+    declineCategory: "transient",
+    rawDeclineCode: `http_${resp.status}`,
+  };
+}
+
 // ─── Stripe ──────────────────────────────────────────────────────────────────
 //
 // Token format: "<paymentIntentId>|<paymentMethodId>|<customerId>"
@@ -154,11 +177,14 @@ async function retryStripe(
     body: body.toString(),
   });
 
-  const json = await resp.json() as Record<string, unknown>;
+  const json = await readJsonBody(resp);
+  if (!json) return nonJsonResult("stripe", resp);
 
   if (resp.ok) {
     const status = json.status as string | undefined;
-    if (status === "succeeded") {
+    // "processing": Stripe accepted the charge and is still settling it, so it
+    // must not be retried. If it fails later Stripe sends a new payment_failed event.
+    if (status === "succeeded" || status === "processing") {
       return {
         ok: true,
         processor: "stripe",
@@ -274,7 +300,8 @@ async function retryAdyen(
     body: JSON.stringify(payload),
   });
 
-  const json = await resp.json() as Record<string, unknown>;
+  const json = await readJsonBody(resp);
+  if (!json) return nonJsonResult("adyen", resp);
   const resultCode = String(json.resultCode ?? "");
   const refusalReason = String(json.refusalReason ?? "");
 
@@ -295,7 +322,7 @@ async function retryAdyen(
   };
 }
 
-function mapAdyenRefusalReason(refusalReason: string, resultCode: string): DeclineCategory {
+export function mapAdyenRefusalReason(refusalReason: string, resultCode: string): DeclineCategory {
   const r = refusalReason.toLowerCase();
   if (resultCode === "RedirectShopper" || r.includes("3d secure") || r.includes("authentication")) {
     return "authentication_required";
@@ -374,8 +401,6 @@ async function retryBraintree(
     body: JSON.stringify({ query, variables }),
   });
 
-  const json = await resp.json() as Record<string, unknown>;
-
   if (!resp.ok) {
     return {
       ok: false,
@@ -384,6 +409,9 @@ async function retryBraintree(
       rawDeclineCode: `http_${resp.status}`,
     };
   }
+
+  const json = await readJsonBody(resp);
+  if (!json) return nonJsonResult("braintree", resp);
 
   const errors = (json.errors as unknown[] | undefined);
   if (errors && errors.length > 0) {

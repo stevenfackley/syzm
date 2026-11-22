@@ -65,7 +65,7 @@ Deno.test("Brain reschedule: sends X-Syzm-Key header", async () => {
   };
 
   await getBrainScheduledAt(
-    { invoice_id: "inv_1", amount_cents: 1000, retry_count: 1, last_decline_category: "insufficient_funds", processor_history: ["stripe"] },
+    { invoice_id: "inv_1", decline_code: "insufficient_funds", region: "US", retry_count: 1, original_amount_cents: 1000, processor_origin: "stripe", processor_history: ["stripe"] },
     "https://brain.internal",
     "test-brain-key",
     mockFetch,
@@ -91,7 +91,7 @@ Deno.test("Brain reschedule: uses Brain-returned scheduled_at", async () => {
     );
 
   const { scheduledAt, usedFallback } = await getBrainScheduledAt(
-    { invoice_id: "inv_2", amount_cents: 5000, retry_count: 2, last_decline_category: "transient", processor_history: ["stripe", "adyen"] },
+    { invoice_id: "inv_2", decline_code: "processing_error", region: "US", retry_count: 2, original_amount_cents: 5000, processor_origin: "stripe", processor_history: ["stripe", "adyen"] },
     "https://brain.internal",
     "key",
     mockFetch,
@@ -121,9 +121,11 @@ Deno.test("Brain reschedule: sends correct payload shape (retry_count+1 incremen
   await getBrainScheduledAt(
     {
       invoice_id: "inv_3",
-      amount_cents: 2000,
+      decline_code: "do_not_honor",
+      region: "GB",
       retry_count: 2, // already incremented by caller
-      last_decline_category: "do_not_honor",
+      original_amount_cents: 2000,
+      processor_origin: "stripe",
       processor_history: ["stripe", "adyen"],
     },
     "https://brain.internal",
@@ -131,11 +133,18 @@ Deno.test("Brain reschedule: sends correct payload shape (retry_count+1 incremen
     mockFetch,
   );
 
+  // Field names must match the Brain's ScheduleRequest (src/brain/app/schemas.py):
+  // pydantic ignores unknown keys, so a misnamed field silently scores as its default.
   const body = capturedBodies[0] as Record<string, unknown>;
   assertEquals(body.invoice_id, "inv_3");
   assertEquals(body.retry_count, 2);
-  assertEquals(body.last_decline_category, "do_not_honor");
+  assertEquals(body.decline_code, "do_not_honor");
+  assertEquals(body.original_amount_cents, 2000);
+  assertEquals(body.region, "GB");
+  assertEquals(body.processor_origin, "stripe");
   assertEquals((body.processor_history as string[]).length, 2);
+  assertEquals("amount_cents" in body, false);
+  assertEquals("last_decline_category" in body, false);
 });
 
 Deno.test("Brain reschedule: falls back to 90min on Brain HTTP error", async () => {
@@ -144,7 +153,7 @@ Deno.test("Brain reschedule: falls back to 90min on Brain HTTP error", async () 
 
   const before = Date.now();
   const { scheduledAt, usedFallback } = await getBrainScheduledAt(
-    { invoice_id: "inv_4", amount_cents: 100, retry_count: 1, last_decline_category: "transient", processor_history: [] },
+    { invoice_id: "inv_4", decline_code: null, region: "US", retry_count: 1, original_amount_cents: 100, processor_origin: "stripe", processor_history: [] },
     "https://brain.internal",
     "k",
     mockFetch,
@@ -164,7 +173,7 @@ Deno.test("Brain reschedule: falls back to 90min on network error", async () => 
   };
 
   const { usedFallback } = await getBrainScheduledAt(
-    { invoice_id: "inv_5", amount_cents: 100, retry_count: 1, last_decline_category: "transient", processor_history: [] },
+    { invoice_id: "inv_5", decline_code: null, region: "US", retry_count: 1, original_amount_cents: 100, processor_origin: "stripe", processor_history: [] },
     "https://brain.internal",
     "k",
     mockFetch,
@@ -185,7 +194,7 @@ Deno.test("Brain reschedule: sends POST to correct URL", async () => {
   };
 
   await getBrainScheduledAt(
-    { invoice_id: "x", amount_cents: 0, retry_count: 0, last_decline_category: "unknown", processor_history: [] },
+    { invoice_id: "x", decline_code: null, region: "US", retry_count: 0, original_amount_cents: 0, processor_origin: "stripe", processor_history: [] },
     "https://brain.syzm.internal",
     "k",
     mockFetch,
