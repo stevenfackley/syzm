@@ -161,6 +161,7 @@ class TestSchedule:
             headers=AUTH,
         )
         assert resp.status_code == 422
+        assert resp.json()["detail"] == "retry_count must be < 4"
 
     def test_invoice_id_in_response(self) -> None:
         resp = client.post(

@@ -2,6 +2,7 @@ from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
+from app.config import settings
 from app.schemas import ScheduleRequest
 from app.services.scheduler import RetryExhaustedError, RetryScheduler
 
@@ -48,7 +49,16 @@ def test_rejects_retry_count_at_or_above_limit() -> None:
     scheduler = RetryScheduler(model=StaticModel(30))
     payload = ScheduleRequest(invoice_id="inv_1", retry_count=4)
 
-    with pytest.raises(RetryExhaustedError):
+    with pytest.raises(RetryExhaustedError, match=r"^retry_count must be < 4$"):
+        scheduler.compute_optimal_retry(payload)
+
+
+def test_exhausted_message_names_the_configured_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "max_retries", 3)
+    scheduler = RetryScheduler(model=StaticModel(30))
+    payload = ScheduleRequest(invoice_id="inv_cap", retry_count=3)
+
+    with pytest.raises(RetryExhaustedError, match=r"^retry_count must be < 3$"):
         scheduler.compute_optimal_retry(payload)
 
 

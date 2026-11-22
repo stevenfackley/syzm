@@ -41,7 +41,7 @@ class RetryScheduler:
         request_id: str = "-",
     ) -> RetryScheduleResult:
         if payload.retry_count >= settings.max_retries:
-            raise RetryExhaustedError("retry_count must be < 4")
+            raise RetryExhaustedError(f"retry_count must be < {settings.max_retries}")
 
         now = now_utc or datetime.now(UTC)
         if now.tzinfo is None:
