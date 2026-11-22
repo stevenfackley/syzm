@@ -6,7 +6,7 @@
  */
 
 import { assertEquals } from "https://deno.land/std@0.224.0/assert/mod.ts";
-import { checkRetryGuards } from "../_shared/guards.ts";
+import { checkRetryGuards, VISA_MAX_RETRIES } from "../_shared/guards.ts";
 
 // ─── Fraud / lost_stolen ──────────────────────────────────────────────────────
 
@@ -44,6 +44,15 @@ const OUTSIDE_BLACKOUT = new Date("2026-06-23T10:00:00Z"); // Tuesday midday
 Deno.test("guards: retry_count=3 is allowed", () => {
   const result = checkRetryGuards("insufficient_funds", 3, OUTSIDE_BLACKOUT);
   assertEquals(result.allowed, true);
+});
+
+Deno.test("guards: the cap is 4, and the guard blocks from the cap up", () => {
+  // execute-retries.ts also uses VISA_MAX_RETRIES for its due-row query and its
+  // exhausted check, so changing it changes all three.
+  assertEquals(VISA_MAX_RETRIES, 4);
+  assertEquals(checkRetryGuards("insufficient_funds", VISA_MAX_RETRIES - 1, OUTSIDE_BLACKOUT).allowed, true);
+  assertEquals(checkRetryGuards("insufficient_funds", VISA_MAX_RETRIES, OUTSIDE_BLACKOUT).allowed, false);
+  assertEquals(checkRetryGuards("insufficient_funds", VISA_MAX_RETRIES + 1, OUTSIDE_BLACKOUT).allowed, false);
 });
 
 // ─── Sunday blackout ─────────────────────────────────────────────────────────

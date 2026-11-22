@@ -5,7 +5,7 @@ import { getBrainScheduledAt } from "./_shared/brain.ts";
 import { readEnv } from "./_shared/config.ts";
 import { json, makeLogger } from "./_shared/http.ts";
 import { retryPayment, type ProcessorCredentials, type RetryResult } from "./_shared/processors.ts";
-import { checkRetryGuards, describeViolation } from "./_shared/guards.ts";
+import { checkRetryGuards, describeViolation, VISA_MAX_RETRIES } from "./_shared/guards.ts";
 import type { DeclineCategory, ProcessorName } from "./_shared/types.ts";
 
 const env = readEnv();
@@ -52,7 +52,7 @@ serve(async (req: Request) => {
           "processor_history, status, decline_category, payment_token, correlation_id",
       )
       .eq("status", "pending")
-      .lt("retry_count", 4)
+      .lt("retry_count", VISA_MAX_RETRIES)
       .lte("scheduled_at", nowIso)
       .limit(500);
 
@@ -149,7 +149,7 @@ serve(async (req: Request) => {
         continue;
       }
 
-      if (newRetryCount >= 4) {
+      if (newRetryCount >= VISA_MAX_RETRIES) {
         exhausted += 1;
         rowLog("info", "retry_exhausted", {
           invoice_id: row.invoice_id,
