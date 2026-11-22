@@ -214,41 +214,51 @@ async function retryStripe(
   };
 }
 
+/**
+ * Stripe decline codes that the retry worker (mapStripeDeclineCode) and the
+ * webhook (mapRawCodeToCategory in normalize.ts) classify the same way.
+ * Lookups are exact and case-sensitive.
+ */
+export const STRIPE_DECLINE_CATEGORIES: ReadonlyMap<string, DeclineCategory> = new Map<
+  string,
+  DeclineCategory
+>([
+  ["insufficient_funds", "insufficient_funds"],
+  ["do_not_honor", "do_not_honor"],
+  ["lost_card", "lost_stolen"],
+  ["stolen_card", "lost_stolen"],
+  ["fraudulent", "fraud"],
+  ["fraud", "fraud"],
+  ["expired_card", "expired_card"],
+  ["incorrect_number", "invalid_data"],
+  ["invalid_number", "invalid_data"],
+  ["issuer_not_available", "transient"],
+  ["processing_error", "transient"],
+  ["card_velocity_exceeded", "velocity"],
+  ["withdrawal_count_limit_exceeded", "velocity"],
+  ["authentication_required", "authentication_required"],
+]);
+
+/**
+ * Stripe codes only the retry worker classifies. The webhook sends each of these
+ * through its substring rules and gets a different answer (noted per row; see
+ * _tests/stripe_declines_test.ts). Which side is right is an open owner decision.
+ */
+const STRIPE_RETRY_ONLY_CATEGORIES: ReadonlyMap<string, DeclineCategory> = new Map<
+  string,
+  DeclineCategory
+>([
+  ["card_decline_rate_limit_exceeded", "insufficient_funds"], // webhook: velocity
+  ["generic_decline", "do_not_honor"], // webhook: unknown
+  ["card_declined", "do_not_honor"], // webhook: unknown
+  ["invalid_expiry_month", "invalid_data"], // webhook: unknown
+  ["invalid_expiry_year", "invalid_data"], // webhook: unknown
+  ["invalid_cvc", "invalid_data"], // webhook: unknown
+  ["try_again_later", "transient"], // webhook: unknown
+]);
+
 function mapStripeDeclineCode(code: string): DeclineCategory {
-  switch (code) {
-    case "insufficient_funds":
-    case "card_decline_rate_limit_exceeded":
-      return "insufficient_funds";
-    case "do_not_honor":
-    case "generic_decline":
-    case "card_declined":
-      return "do_not_honor";
-    case "lost_card":
-    case "stolen_card":
-      return "lost_stolen";
-    case "fraudulent":
-    case "fraud":
-      return "fraud";
-    case "expired_card":
-      return "expired_card";
-    case "incorrect_number":
-    case "invalid_number":
-    case "invalid_expiry_month":
-    case "invalid_expiry_year":
-    case "invalid_cvc":
-      return "invalid_data";
-    case "issuer_not_available":
-    case "try_again_later":
-    case "processing_error":
-      return "transient";
-    case "card_velocity_exceeded":
-    case "withdrawal_count_limit_exceeded":
-      return "velocity";
-    case "authentication_required":
-      return "authentication_required";
-    default:
-      return "unknown";
-  }
+  return STRIPE_DECLINE_CATEGORIES.get(code) ?? STRIPE_RETRY_ONLY_CATEGORIES.get(code) ?? "unknown";
 }
 
 // ─── Adyen ───────────────────────────────────────────────────────────────────

@@ -9,7 +9,11 @@
 
 import { assertEquals } from "https://deno.land/std@0.224.0/assert/mod.ts";
 import { mapRawCodeToCategory } from "../_shared/normalize.ts";
-import { retryPayment, type ProcessorCredentials } from "../_shared/processors.ts";
+import {
+  type ProcessorCredentials,
+  retryPayment,
+  STRIPE_DECLINE_CATEGORIES,
+} from "../_shared/processors.ts";
 import type { DeclineCategory } from "../_shared/types.ts";
 
 const creds: ProcessorCredentials = {
@@ -80,6 +84,15 @@ for (const [code, worker, webhook] of TABLE) {
     assertEquals(mapRawCodeToCategory("stripe", code), webhook);
   });
 }
+
+Deno.test("Stripe decline: every shared code gets the shared answer on both sides", async () => {
+  const pinned = new Set(TABLE.map(([code]) => code));
+  for (const [code, category] of STRIPE_DECLINE_CATEGORIES) {
+    assertEquals(pinned.has(code), true, `${code} is missing from TABLE above`);
+    assertEquals(await workerCategory(code), category, code);
+    assertEquals(mapRawCodeToCategory("stripe", code), category, code);
+  }
+});
 
 Deno.test("Stripe decline: the worker matches codes case-sensitively", async () => {
   // The webhook lower-cases before classifying (normalizeDecline); the worker does not.

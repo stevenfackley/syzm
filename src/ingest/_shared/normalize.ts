@@ -3,7 +3,7 @@
  * import it (webhook.ts starts a server when imported).
  */
 
-import { mapAdyenRefusalReason } from "./processors.ts";
+import { mapAdyenRefusalReason, STRIPE_DECLINE_CATEGORIES } from "./processors.ts";
 import type { DeclineCategory, NormalizedDecline, ProcessorName } from "./types.ts";
 
 // Webhook payloads are loosely shaped per processor; a permissive record keeps
@@ -126,16 +126,10 @@ export function mapRawCodeToCategory(processor: ProcessorName, rawCode: string):
   if (!rawCode) return "unknown";
   // Adyen sends refusal text ("Not enough balance"), which the generic rules below miss.
   if (processor === "adyen") return mapAdyenRefusalReason(rawCode, "");
-  // Stripe-specific codes
+  // Stripe-specific codes: the ones the retry worker classifies the same way.
   if (processor === "stripe") {
-    if (["lost_card", "stolen_card"].includes(rawCode)) return "lost_stolen";
-    if (["fraudulent", "fraud"].includes(rawCode)) return "fraud";
-    if (rawCode === "expired_card") return "expired_card";
-    if (["incorrect_number", "invalid_number"].includes(rawCode)) return "invalid_data";
-    if (rawCode === "insufficient_funds") return "insufficient_funds";
-    if (["issuer_not_available", "processing_error"].includes(rawCode)) return "transient";
-    if (rawCode === "card_velocity_exceeded") return "velocity";
-    if (rawCode === "authentication_required") return "authentication_required";
+    const category = STRIPE_DECLINE_CATEGORIES.get(rawCode);
+    if (category) return category;
   }
   // Generic / shared
   if (rawCode.includes("insufficient") || rawCode === "51") return "insufficient_funds";
