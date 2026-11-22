@@ -1,16 +1,12 @@
 import { serve } from "@std/http";
 import { createClient } from "@supabase/supabase-js";
 
+import { getBrainScheduledAt } from "./_shared/brain.ts";
 import { readEnv } from "./_shared/config.ts";
 import { json, makeLogger } from "./_shared/http.ts";
 import { retryPayment, type ProcessorCredentials, type RetryResult } from "./_shared/processors.ts";
 import { checkRetryGuards, describeViolation } from "./_shared/guards.ts";
-import type {
-  BrainScheduleRequest,
-  BrainScheduleResponse,
-  DeclineCategory,
-  ProcessorName,
-} from "./_shared/types.ts";
+import type { DeclineCategory, ProcessorName } from "./_shared/types.ts";
 
 const env = readEnv();
 const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY);
@@ -187,6 +183,8 @@ serve(async (req: Request) => {
           processor_origin: row.processor_origin,
           processor_history: history,
         },
+        env.BRAIN_URL,
+        env.BRAIN_API_KEY,
         rowLog,
       );
 
@@ -226,50 +224,6 @@ serve(async (req: Request) => {
     return json({ error: "execute_retries_error" }, 500);
   }
 });
-
-// ─── Brain schedule ──────────────────────────────────────────────────────────
-
-async function getBrainScheduledAt(
-  request: BrainScheduleRequest,
-  log: ReturnType<typeof makeLogger>,
-): Promise<string> {
-  try {
-    const resp = await fetch(`${env.BRAIN_URL}/v1/schedule`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Syzm-Key": env.BRAIN_API_KEY,
-      },
-      body: JSON.stringify(request),
-    });
-
-    if (!resp.ok) {
-      throw new Error(`brain_http_${resp.status}`);
-    }
-
-    const body = (await resp.json()) as BrainScheduleResponse;
-    if (!body.scheduled_at_utc) {
-      throw new Error("brain_missing_scheduled_at");
-    }
-
-    log("info", "brain_schedule_ok", {
-      invoice_id: request.invoice_id,
-      scheduled_at: body.scheduled_at_utc,
-      reason: body.reason,
-    });
-
-    return body.scheduled_at_utc;
-  } catch (err) {
-    // Brain is unreachable — log prominently and use 90-min fallback.
-    const msg = err instanceof Error ? err.message : String(err);
-    log("error", "brain_schedule_fallback", {
-      invoice_id: request.invoice_id,
-      brain_error: msg,
-      fallback_minutes: 90,
-    });
-    return new Date(Date.now() + 90 * 60 * 1000).toISOString();
-  }
-}
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 

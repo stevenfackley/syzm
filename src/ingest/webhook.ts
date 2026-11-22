@@ -1,6 +1,7 @@
 import { serve } from "@std/http";
 import { createClient } from "@supabase/supabase-js";
 
+import { requestBrainSchedule } from "./_shared/brain.ts";
 import { readEnv } from "./_shared/config.ts";
 import { json, makeLogger } from "./_shared/http.ts";
 import { normalizeDecline } from "./_shared/normalize.ts";
@@ -9,12 +10,7 @@ import {
   verifySignature,
   type ProcessorSecrets,
 } from "./_shared/verify.ts";
-import type {
-  BrainScheduleRequest,
-  BrainScheduleResponse,
-  NormalizedDecline,
-  ProcessorName,
-} from "./_shared/types.ts";
+import type { ProcessorName } from "./_shared/types.ts";
 
 const env = readEnv();
 const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY);
@@ -135,39 +131,4 @@ function getProcessorFromPath(url: string): ProcessorName {
     throw new Error("invalid_processor");
   }
   return value;
-}
-
-// ─── Brain schedule ──────────────────────────────────────────────────────────
-
-async function requestBrainSchedule(
-  payload: NormalizedDecline,
-  brainUrl: string,
-  brainApiKey: string,
-  log: ReturnType<typeof makeLogger>,
-): Promise<BrainScheduleResponse> {
-  const brainRequest: BrainScheduleRequest = {
-    invoice_id: payload.invoice_id,
-    decline_code: payload.decline_code,
-    region: payload.region,
-    retry_count: payload.retry_count,
-    original_amount_cents: payload.original_amount_cents,
-    processor_origin: payload.processor_origin,
-    processor_history: payload.processor_history,
-  };
-
-  const response = await fetch(`${brainUrl}/v1/schedule`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Syzm-Key": brainApiKey,
-    },
-    body: JSON.stringify(brainRequest),
-  });
-
-  if (!response.ok) {
-    log("error", "brain_schedule_failed", { status: response.status });
-    throw new Error(`brain_schedule_failed_${response.status}`);
-  }
-
-  return (await response.json()) as BrainScheduleResponse;
 }
