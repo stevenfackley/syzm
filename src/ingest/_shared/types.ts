@@ -36,11 +36,18 @@ export type NormalizedDecline = {
   soft_decline: boolean;
 };
 
+/**
+ * Mirrors the Brain's ScheduleRequest (src/brain/app/schemas.py and
+ * src/shared/openapi/syzm-brain.yaml). bank_bin is left out: the Brain does not
+ * score on it and rejects a value that is not all digits.
+ */
 export type BrainScheduleRequest = {
   invoice_id: string;
-  amount_cents: number;
+  decline_code: string | null;
+  region: string;
   retry_count: number;
-  last_decline_category: DeclineCategory;
+  original_amount_cents: number;
+  processor_origin: ProcessorName;
   processor_history: ProcessorName[];
 };
 

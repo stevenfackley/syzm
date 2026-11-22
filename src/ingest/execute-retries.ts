@@ -2,7 +2,7 @@ import { serve } from "@std/http";
 import { createClient } from "@supabase/supabase-js";
 
 import { readEnv } from "./_shared/config.ts";
-import { retryPayment, type ProcessorCredentials } from "./_shared/processors.ts";
+import { retryPayment, type ProcessorCredentials, type RetryResult } from "./_shared/processors.ts";
 import { checkRetryGuards, describeViolation } from "./_shared/guards.ts";
 import type {
   BrainScheduleRequest,
@@ -28,6 +28,7 @@ type QueueRow = {
   invoice_id: string;
   retry_count: number;
   original_amount_cents: number;
+  region: string;
   processor_origin: ProcessorName;
   processor_history: ProcessorName[] | null;
   status: string;
@@ -50,7 +51,7 @@ serve(async (req: Request) => {
     const { data, error } = await supabase
       .from("syzm_recovery_queue")
       .select(
-        "id, invoice_id, retry_count, original_amount_cents, processor_origin, " +
+        "id, invoice_id, retry_count, original_amount_cents, region, processor_origin, " +
           "processor_history, status, decline_category, payment_token, correlation_id",
       )
       .eq("status", "pending")
@@ -68,6 +69,8 @@ serve(async (req: Request) => {
     let rescheduled = 0;
     let exhausted = 0;
     let guarded = 0;
+    let errored = 0;
+    let writeFailed = 0;
 
     for (const row of rows) {
       const rowCorrelation = row.correlation_id ?? batchCorrelationId;
@@ -84,33 +87,44 @@ serve(async (req: Request) => {
           violation: guardResult.violation.reason,
           reason,
         });
-        await supabase
-          .from("syzm_recovery_queue")
-          .update({ status: "blocked", exhausted_at: nowIso, schedule_reason: reason })
-          .eq("id", row.id);
+        if (!(await updateQueueRow(row, { status: "blocked", exhausted_at: nowIso, schedule_reason: reason }, rowLog))) {
+          writeFailed += 1;
+        }
         continue;
       }
 
       if (!row.payment_token) {
         rowLog("error", "missing_payment_token", { invoice_id: row.invoice_id });
-        await supabase
-          .from("syzm_recovery_queue")
-          .update({ status: "error", schedule_reason: "missing_payment_token" })
-          .eq("id", row.id);
+        if (!(await updateQueueRow(row, { status: "error", schedule_reason: "missing_payment_token" }, rowLog))) {
+          writeFailed += 1;
+        }
         continue;
       }
 
       const nextProcessor = pickNextProcessor(row.processor_origin, row.processor_history ?? []);
-      const result = await retryPayment(
-        nextProcessor,
-        {
-          invoiceId: row.invoice_id,
-          amountCents: row.original_amount_cents,
-          paymentToken: row.payment_token,
-        },
-        processorCreds,
-        rowCorrelation,
-      );
+      let result: RetryResult;
+      try {
+        result = await retryPayment(
+          nextProcessor,
+          {
+            invoiceId: row.invoice_id,
+            amountCents: row.original_amount_cents,
+            paymentToken: row.payment_token,
+          },
+          processorCreds,
+          rowCorrelation,
+        );
+      } catch (err) {
+        // A network error has no known outcome. Leave the row untouched (still
+        // pending, same processor next run) and go on with the rest of the batch.
+        errored += 1;
+        rowLog("error", "retry_attempt_error", {
+          invoice_id: row.invoice_id,
+          processor: nextProcessor,
+          message: err instanceof Error ? err.message : String(err),
+        });
+        continue;
+      }
 
       const history = [...(row.processor_history ?? []), nextProcessor];
       const newRetryCount = row.retry_count + 1;
@@ -122,16 +136,19 @@ serve(async (req: Request) => {
           processor: nextProcessor,
           reference: result.processorReference,
         });
-        await supabase
-          .from("syzm_recovery_queue")
-          .update({
+        // A failed write here means a charge that the queue does not know about;
+        // the logged patch carries the processor reference for reconciliation.
+        if (
+          !(await updateQueueRow(row, {
             status: "recovered",
             processor_history: history,
             recovered_at: nowIso,
             processor_reference: result.processorReference,
             retry_count: newRetryCount,
-          })
-          .eq("id", row.id);
+          }, rowLog))
+        ) {
+          writeFailed += 1;
+        }
         continue;
       }
 
@@ -142,17 +159,18 @@ serve(async (req: Request) => {
           retry_count: newRetryCount,
           decline_category: result.declineCategory,
         });
-        await supabase
-          .from("syzm_recovery_queue")
-          .update({
+        if (
+          !(await updateQueueRow(row, {
             status: "exhausted",
             retry_count: newRetryCount,
             processor_history: history,
             exhausted_at: nowIso,
             decline_category: result.declineCategory,
             last_decline_code: result.rawDeclineCode ?? null,
-          })
-          .eq("id", row.id);
+          }, rowLog))
+        ) {
+          writeFailed += 1;
+        }
         continue;
       }
 
@@ -161,9 +179,11 @@ serve(async (req: Request) => {
       const nextSchedule = await getBrainScheduledAt(
         {
           invoice_id: row.invoice_id,
-          amount_cents: row.original_amount_cents,
+          decline_code: result.rawDeclineCode ?? null,
+          region: row.region,
           retry_count: newRetryCount,
-          last_decline_category: result.declineCategory,
+          original_amount_cents: row.original_amount_cents,
+          processor_origin: row.processor_origin,
           processor_history: history,
         },
         rowLog,
@@ -176,22 +196,27 @@ serve(async (req: Request) => {
         decline_category: result.declineCategory,
       });
 
-      await supabase
-        .from("syzm_recovery_queue")
-        .update({
+      if (
+        !(await updateQueueRow(row, {
           status: "pending",
           retry_count: newRetryCount,
           processor_history: history,
           scheduled_at: nextSchedule,
           decline_category: result.declineCategory,
           last_decline_code: result.rawDeclineCode ?? null,
-        })
-        .eq("id", row.id);
+        }, rowLog))
+      ) {
+        writeFailed += 1;
+      }
     }
 
-    log("info", "batch_complete", { processed: rows.length, recovered, rescheduled, exhausted, guarded });
+    log("info", "batch_complete", {
+      processed: rows.length, recovered, rescheduled, exhausted, guarded, errored, write_failed: writeFailed,
+    });
 
-    return json({ processed: rows.length, recovered, rescheduled, exhausted, guarded });
+    return json({
+      processed: rows.length, recovered, rescheduled, exhausted, guarded, errored, write_failed: writeFailed,
+    });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(
@@ -246,6 +271,26 @@ async function getBrainScheduledAt(
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/** Write a queue-row update. A failed write is logged and returns false. */
+async function updateQueueRow(
+  row: QueueRow,
+  patch: Record<string, unknown>,
+  log: ReturnType<typeof makeLogger>,
+): Promise<boolean> {
+  const { error } = await supabase.from("syzm_recovery_queue").update(patch).eq("id", row.id);
+  if (error) {
+    log("error", "queue_update_failed", {
+      row_id: row.id,
+      invoice_id: row.invoice_id,
+      patch,
+      message: error.message,
+      code: error.code,
+    });
+    return false;
+  }
+  return true;
+}
 
 function pickNextProcessor(origin: ProcessorName, history: ProcessorName[]): ProcessorName {
   const route: ProcessorName[] = [origin, "adyen", "braintree", "stripe"];
