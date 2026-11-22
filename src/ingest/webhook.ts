@@ -2,6 +2,7 @@ import { serve } from "@std/http";
 import { createClient } from "@supabase/supabase-js";
 
 import { readEnv } from "./_shared/config.ts";
+import { json, makeLogger } from "./_shared/http.ts";
 import { type AdyenDecline, readAdyenDecline } from "./_shared/normalize.ts";
 import { mapAdyenRefusalReason } from "./_shared/processors.ts";
 import {
@@ -289,32 +290,4 @@ async function requestBrainSchedule(
   }
 
   return (await response.json()) as BrainScheduleResponse;
-}
-
-// ─── Logging ─────────────────────────────────────────────────────────────────
-
-function makeLogger(correlationId: string) {
-  return function log(
-    level: "info" | "warn" | "error",
-    event: string,
-    extra?: Record<string, unknown>,
-  ) {
-    const entry = JSON.stringify({ level, event, correlation_id: correlationId, ...extra });
-    if (level === "error") {
-      console.error(entry);
-    } else if (level === "warn") {
-      console.warn(entry);
-    } else {
-      console.log(entry);
-    }
-  };
-}
-
-// ─── Response helper ─────────────────────────────────────────────────────────
-
-function json(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
 }
