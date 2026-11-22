@@ -36,8 +36,13 @@ Deno.test("guards: retry_count=4 is blocked (Visa cap)", () => {
   }
 });
 
+// The two "allowed" tests below pin the clock. Without a date the guard reads the real
+// one, and a run that lands in the Sunday 05:00–08:00 UTC blackout gets "blocked":
+// the suite then fails for three hours every week with nothing wrong in the code.
+const OUTSIDE_BLACKOUT = new Date("2026-06-23T10:00:00Z"); // Tuesday midday
+
 Deno.test("guards: retry_count=3 is allowed", () => {
-  const result = checkRetryGuards("insufficient_funds", 3);
+  const result = checkRetryGuards("insufficient_funds", 3, OUTSIDE_BLACKOUT);
   assertEquals(result.allowed, true);
 });
 
@@ -80,6 +85,6 @@ Deno.test("guards: normal retry is allowed", () => {
 });
 
 Deno.test("guards: retry_count=0 with unknown category is allowed", () => {
-  const result = checkRetryGuards("unknown", 0);
+  const result = checkRetryGuards("unknown", 0, OUTSIDE_BLACKOUT);
   assertEquals(result.allowed, true);
 });
