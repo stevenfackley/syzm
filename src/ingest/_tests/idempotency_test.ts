@@ -11,26 +11,16 @@
  */
 
 import { assertEquals, assertNotEquals } from "https://deno.land/std@0.224.0/assert/mod.ts";
+import { extractProcessorEventId as extractWithObj } from "../_shared/normalize.ts";
+import type { ProcessorName } from "../_shared/types.ts";
 
-// ─── Mirror extractProcessorEventId (private in webhook.ts; replicated here) ──
-
+// The real function also takes the nested Stripe object, which it does not read.
 function extractProcessorEventId(
-  processor: "stripe" | "adyen" | "braintree",
-  p: Record<string, any>,
+  processor: ProcessorName,
+  p: Record<string, unknown>,
   correlationId: string,
 ): string {
-  switch (processor) {
-    case "stripe":
-      return String(p.id ?? p.event_id ?? `stripe-unknown-${correlationId}`);
-    case "adyen":
-      return String(
-        p.notificationItems?.[0]?.NotificationRequestItem?.pspReference ??
-          p.pspReference ??
-          `adyen-unknown-${correlationId}`,
-      );
-    case "braintree":
-      return String(p.bt_signature ?? p.id ?? `braintree-unknown-${correlationId}`);
-  }
+  return extractWithObj(processor, p, {}, correlationId);
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -94,6 +84,16 @@ Deno.test("idempotency: unknown Stripe event falls back with correlation prefix"
 
   const id = extractProcessorEventId("stripe", payload, "unique-corr-xyz");
   assertEquals(id, "stripe-unknown-unique-corr-xyz");
+});
+
+Deno.test("idempotency: Stripe falls back to event_id", () => {
+  assertEquals(extractProcessorEventId("stripe", { event_id: "evt_alt" }, "corr"), "evt_alt");
+});
+
+Deno.test("idempotency: Adyen and Braintree fall back with correlation prefix", () => {
+  assertEquals(extractProcessorEventId("adyen", {}, "c1"), "adyen-unknown-c1");
+  assertEquals(extractProcessorEventId("braintree", {}, "c2"), "braintree-unknown-c2");
+  assertEquals(extractProcessorEventId("braintree", { id: "bt_id" }, "c3"), "bt_id");
 });
 
 Deno.test("idempotency: upsert shape uses processor_event_id conflict key (documentation test)", () => {

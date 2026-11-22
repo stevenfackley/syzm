@@ -18,8 +18,10 @@ export type GuardResult =
 /**
  * Visa/network cap: no more than 4 total attempts (retry_count is the number of
  * retries ALREADY attempted; we'd be making attempt #retry_count+1).
+ * execute-retries.ts uses the same cap for its due-row query and its
+ * exhausted check.
  */
-const VISA_MAX_RETRIES = 4;
+export const VISA_MAX_RETRIES = 4;
 
 /**
  * Sunday 01:00–03:00 ET US bank processing blackout.

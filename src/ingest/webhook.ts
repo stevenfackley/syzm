@@ -1,21 +1,16 @@
 import { serve } from "@std/http";
 import { createClient } from "@supabase/supabase-js";
 
+import { requestBrainSchedule } from "./_shared/brain.ts";
 import { readEnv } from "./_shared/config.ts";
-import { type AdyenDecline, readAdyenDecline } from "./_shared/normalize.ts";
-import { mapAdyenRefusalReason } from "./_shared/processors.ts";
+import { json, makeLogger } from "./_shared/http.ts";
+import { normalizeDecline } from "./_shared/normalize.ts";
 import {
   SignatureVerificationError,
   verifySignature,
   type ProcessorSecrets,
 } from "./_shared/verify.ts";
-import type {
-  BrainScheduleRequest,
-  BrainScheduleResponse,
-  DeclineCategory,
-  NormalizedDecline,
-  ProcessorName,
-} from "./_shared/types.ts";
+import type { ProcessorName } from "./_shared/types.ts";
 
 const env = readEnv();
 const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY);
@@ -136,185 +131,4 @@ function getProcessorFromPath(url: string): ProcessorName {
     throw new Error("invalid_processor");
   }
   return value;
-}
-
-// ─── Normalization ───────────────────────────────────────────────────────────
-
-// Webhook payloads are loosely shaped per processor; a permissive record keeps
-// the field-coalescing below readable.
-// deno-lint-ignore no-explicit-any
-type LooseRecord = Record<string, any>;
-
-function normalizeDecline(
-  processor: ProcessorName,
-  payload: Record<string, unknown>,
-  correlationId: string,
-): NormalizedDecline {
-  const p = payload as LooseRecord;
-  const obj = p.data?.object ?? {};
-  const adyen: AdyenDecline = processor === "adyen" ? readAdyenDecline(p) : {};
-
-  const invoiceId = String(
-    p.invoice_id ??
-      p.invoiceId ??
-      obj.invoice ??
-      adyen.merchantReference ??
-      `unknown_${correlationId}`,
-  );
-
-  // Extract processor-specific idempotency id for deduplication.
-  const processorEventId = extractProcessorEventId(processor, p, obj, correlationId);
-
-  const rawDeclineCode = String(
-    p.decline_code ??
-      p.declineCode ??
-      obj.last_payment_error?.decline_code ??
-      // Adyen
-      adyen.reason ??
-      p.refusalReason ??
-      "",
-  ).toLowerCase();
-
-  const amount = Number(
-    p.amount_cents ??
-      p.amount ??
-      obj.amount_due ??
-      adyen.amountMinorUnits ??
-      0,
-  );
-
-  const declineCategory = mapRawCodeToCategory(processor, rawDeclineCode);
-  const softDeclineCodes = new Set(["do_not_honor", "51", "insufficient_funds", "issuer_unavailable"]);
-  const softDecline =
-    softDeclineCodes.has(rawDeclineCode) ||
-    ["insufficient_funds", "do_not_honor", "transient", "velocity", "authentication_required"].includes(
-      declineCategory,
-    );
-
-  return {
-    invoice_id: invoiceId,
-    processor_event_id: processorEventId,
-    decline_code: rawDeclineCode || null,
-    decline_category: declineCategory,
-    bank_bin: String(p.bank_bin ?? p.bankBin ?? "").slice(0, 8) || null,
-    region: String(p.region ?? p.country ?? "US"),
-    retry_count: Number(p.retry_count ?? 0),
-    original_amount_cents: Number.isFinite(amount) ? Math.max(0, Math.trunc(amount)) : 0,
-    processor_origin: processor,
-    processor_history: [processor],
-    soft_decline: softDecline,
-  };
-}
-
-function extractProcessorEventId(
-  processor: ProcessorName,
-  p: LooseRecord,
-  _obj: LooseRecord,
-  correlationId: string,
-): string {
-  switch (processor) {
-    case "stripe":
-      // Stripe sends the event id at top level.
-      return String(p.id ?? p.event_id ?? `stripe-unknown-${correlationId}`);
-    case "adyen":
-      // Adyen: pspReference is unique per notification item.
-      return String(
-        p.notificationItems?.[0]?.NotificationRequestItem?.pspReference ??
-          p.pspReference ??
-          `adyen-unknown-${correlationId}`,
-      );
-    case "braintree":
-      // Braintree: bt_payload contains a base64'd XML; use the payload hash as id.
-      return String(p.bt_signature ?? p.id ?? `braintree-unknown-${correlationId}`);
-  }
-}
-
-function mapRawCodeToCategory(processor: ProcessorName, rawCode: string): DeclineCategory {
-  if (!rawCode) return "unknown";
-  // Adyen sends refusal text ("Not enough balance"), which the generic rules below miss.
-  if (processor === "adyen") return mapAdyenRefusalReason(rawCode, "");
-  // Stripe-specific codes
-  if (processor === "stripe") {
-    if (["lost_card", "stolen_card"].includes(rawCode)) return "lost_stolen";
-    if (["fraudulent", "fraud"].includes(rawCode)) return "fraud";
-    if (rawCode === "expired_card") return "expired_card";
-    if (["incorrect_number", "invalid_number"].includes(rawCode)) return "invalid_data";
-    if (rawCode === "insufficient_funds") return "insufficient_funds";
-    if (["issuer_not_available", "processing_error"].includes(rawCode)) return "transient";
-    if (rawCode === "card_velocity_exceeded") return "velocity";
-    if (rawCode === "authentication_required") return "authentication_required";
-  }
-  // Generic / shared
-  if (rawCode.includes("insufficient") || rawCode === "51") return "insufficient_funds";
-  if (rawCode.includes("fraud")) return "fraud";
-  if (rawCode.includes("stolen") || rawCode.includes("lost")) return "lost_stolen";
-  if (rawCode.includes("expired")) return "expired_card";
-  if (rawCode.includes("do_not_honor") || rawCode.includes("do not honour")) return "do_not_honor";
-  if (rawCode.includes("velocity") || rawCode.includes("limit")) return "velocity";
-  if (rawCode.includes("authentication")) return "authentication_required";
-  if (rawCode === "issuer_unavailable") return "transient";
-  return "unknown";
-}
-
-// ─── Brain schedule ──────────────────────────────────────────────────────────
-
-async function requestBrainSchedule(
-  payload: NormalizedDecline,
-  brainUrl: string,
-  brainApiKey: string,
-  log: ReturnType<typeof makeLogger>,
-): Promise<BrainScheduleResponse> {
-  const brainRequest: BrainScheduleRequest = {
-    invoice_id: payload.invoice_id,
-    decline_code: payload.decline_code,
-    region: payload.region,
-    retry_count: payload.retry_count,
-    original_amount_cents: payload.original_amount_cents,
-    processor_origin: payload.processor_origin,
-    processor_history: payload.processor_history,
-  };
-
-  const response = await fetch(`${brainUrl}/v1/schedule`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Syzm-Key": brainApiKey,
-    },
-    body: JSON.stringify(brainRequest),
-  });
-
-  if (!response.ok) {
-    log("error", "brain_schedule_failed", { status: response.status });
-    throw new Error(`brain_schedule_failed_${response.status}`);
-  }
-
-  return (await response.json()) as BrainScheduleResponse;
-}
-
-// ─── Logging ─────────────────────────────────────────────────────────────────
-
-function makeLogger(correlationId: string) {
-  return function log(
-    level: "info" | "warn" | "error",
-    event: string,
-    extra?: Record<string, unknown>,
-  ) {
-    const entry = JSON.stringify({ level, event, correlation_id: correlationId, ...extra });
-    if (level === "error") {
-      console.error(entry);
-    } else if (level === "warn") {
-      console.warn(entry);
-    } else {
-      console.log(entry);
-    }
-  };
-}
-
-// ─── Response helper ─────────────────────────────────────────────────────────
-
-function json(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
 }
