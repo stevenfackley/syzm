@@ -10,8 +10,38 @@ class StaticModel:
     def __init__(self, minutes: int) -> None:
         self.minutes = minutes
 
-    def score_delay_minutes(self, payload: ScheduleRequest) -> int:
+    def score_delay_minutes(self, payload: ScheduleRequest, request_id: str = "-") -> int:
         return self.minutes
+
+
+class RecordingModel:
+    def __init__(self, minutes: int) -> None:
+        self.minutes = minutes
+        self.request_ids: list[str] = []
+
+    def score_delay_minutes(self, payload: ScheduleRequest, request_id: str = "-") -> int:
+        self.request_ids.append(request_id)
+        return self.minutes
+
+
+def test_forwards_request_id_to_model() -> None:
+    model = RecordingModel(30)
+    scheduler = RetryScheduler(model=model)
+    payload = ScheduleRequest(invoice_id="inv_rid", retry_count=0)
+
+    scheduler.compute_optimal_retry(payload, request_id="rid-123")
+
+    assert model.request_ids == ["rid-123"]
+
+
+def test_request_id_defaults_to_dash() -> None:
+    model = RecordingModel(30)
+    scheduler = RetryScheduler(model=model)
+    payload = ScheduleRequest(invoice_id="inv_rid_default", retry_count=0)
+
+    scheduler.compute_optimal_retry(payload)
+
+    assert model.request_ids == ["-"]
 
 
 def test_rejects_retry_count_at_or_above_limit() -> None:

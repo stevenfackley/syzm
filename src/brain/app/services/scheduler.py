@@ -2,15 +2,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Protocol
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.config import settings
 from app.schemas import ProcessorName, ScheduleRequest
-from app.services.model_registry import BrainModel
 
 
 class RetryExhaustedError(ValueError):
     """Raised when a retry candidate has reached the global retry ceiling."""
+
+
+class DelayModel(Protocol):
+    """What the scheduler needs from a model; BrainModel is the real one."""
+
+    def score_delay_minutes(self, payload: ScheduleRequest, request_id: str = "-") -> int: ...
 
 
 @dataclass
@@ -21,7 +27,7 @@ class RetryScheduleResult:
 
 
 class RetryScheduler:
-    def __init__(self, model: BrainModel) -> None:
+    def __init__(self, model: DelayModel) -> None:
         self.model = model
         try:
             self.tz = ZoneInfo(settings.timezone)
@@ -41,12 +47,7 @@ class RetryScheduler:
         if now.tzinfo is None:
             now = now.replace(tzinfo=UTC)
 
-        import inspect as _inspect
-        _sig = _inspect.signature(self.model.score_delay_minutes)
-        if "request_id" in _sig.parameters:
-            delay_minutes = self.model.score_delay_minutes(payload, request_id=request_id)
-        else:
-            delay_minutes = self.model.score_delay_minutes(payload)
+        delay_minutes = self.model.score_delay_minutes(payload, request_id=request_id)
         candidate = now + timedelta(minutes=delay_minutes)
         candidate = self._shift_outside_maintenance(candidate)
         candidate = candidate.replace(second=0, microsecond=0)
