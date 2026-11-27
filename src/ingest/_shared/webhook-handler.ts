@@ -4,8 +4,9 @@
  */
 
 import { json, type Logger, makeLogger } from "./http.ts";
-import { normalizeDecline } from "./normalize.ts";
+import { normalizeDecline, readAdyenDecline } from "./normalize.ts";
 import { type QueueTable, UNIQUE_VIOLATION } from "./queue.ts";
+import { isAttemptIdempotencyKey } from "./retry-worker.ts";
 import type { BrainScheduleResponse, NormalizedDecline, ProcessorName } from "./types.ts";
 import { type ProcessorSecrets, SignatureVerificationError, verifySignature } from "./verify.ts";
 
@@ -63,6 +64,19 @@ export function createWebhookHandler(deps: WebhookDeps): (req: Request) => Promi
         soft_decline: normalized.soft_decline,
         decline_category: normalized.decline_category,
       });
+
+      // A decline of one of the worker's own retries is already on its row: the
+      // worker records the answer it got. Queuing it would open a second
+      // chargeable row for the same debt.
+      const ownAttemptKey = ownRetryAttemptKey(processor, body);
+      if (ownAttemptKey) {
+        log("info", "webhook_own_retry", {
+          processor,
+          attempt_key: ownAttemptKey,
+          processor_event_id: normalized.processor_event_id,
+        });
+        return json({ accepted: false, reason: "own_retry" }, 202);
+      }
 
       if (!normalized.soft_decline) {
         log("info", "webhook_not_soft_decline", {
@@ -126,6 +140,28 @@ export function createWebhookHandler(deps: WebhookDeps): (req: Request) => Promi
       return json({ error: "ingest_error" }, 500);
     }
   };
+}
+
+/**
+ * The worker's attempt key when the event is about one of its own retries:
+ * Stripe, the metadata syzm_attempt_key on a PaymentIntent the worker created;
+ * Adyen, a merchantReference that is an attempt key (the worker sends its key
+ * as the payment reference). Braintree notifications are not decoded yet.
+ */
+export function ownRetryAttemptKey(processor: ProcessorName, payload: Record<string, unknown>): string | undefined {
+  switch (processor) {
+    case "stripe": {
+      // deno-lint-ignore no-explicit-any
+      const key = (payload as any).data?.object?.metadata?.syzm_attempt_key;
+      return typeof key === "string" && key !== "" ? key : undefined;
+    }
+    case "adyen": {
+      const reference = readAdyenDecline(payload).merchantReference;
+      return isAttemptIdempotencyKey(reference) ? reference : undefined;
+    }
+    case "braintree":
+      return undefined;
+  }
 }
 
 // ─── Processor path ──────────────────────────────────────────────────────────

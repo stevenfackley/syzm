@@ -225,6 +225,30 @@ async function stripeSignature(timestamp: string, body: string): Promise<string>
   return Array.from(new Uint8Array(sig)).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+/** HMAC key the test webhook is configured with for Adyen (hex). */
+const ADYEN_HMAC_KEY_HEX = "00";
+
+/** A refused Adyen AUTHORISATION notification, signed the way verify.ts checks it. */
+async function adyenRefused(pspReference: string, merchantReference: string): Promise<Record<string, unknown>> {
+  const item: Record<string, unknown> = {
+    pspReference,
+    merchantAccountCode: "TestMerchant",
+    merchantReference,
+    amount: { value: 1999, currency: "USD" },
+    eventCode: "AUTHORISATION",
+    success: "false",
+    reason: "Not enough balance",
+  };
+  const fields = [pspReference, "", "TestMerchant", merchantReference, "", "", "AUTHORISATION", "false"];
+  const signed = fields.map((f) => f.replace(/\\/g, "\\\\").replace(/:/g, "\\:")).join(":");
+  const key = await crypto.subtle.importKey("raw", new Uint8Array([0]), { name: "HMAC", hash: "SHA-256" }, false, [
+    "sign",
+  ]);
+  const sig = new Uint8Array(await crypto.subtle.sign("HMAC", key, enc.encode(signed)));
+  item.additionalData = { hmacSignature: btoa(String.fromCharCode(...sig)) };
+  return { live: "false", notificationItems: [{ NotificationRequestItem: item }] };
+}
+
 function paymentFailed(eventId: string, invoiceId: string, declineCode = "insufficient_funds") {
   return {
     id: eventId,
@@ -240,6 +264,7 @@ type Pipeline = {
   net: ProcessorNetwork;
   clock: { now: () => Date; advance(ms: number): void };
   deliver(event: unknown): Promise<{ status: number; body: Record<string, unknown> }>;
+  deliverAdyen(notification: unknown): Promise<{ status: number; body: Record<string, unknown> }>;
   run(table?: QueueTable): ReturnType<typeof runRetryBatch>;
   giveToken(): Promise<void>;
   /** Make the next attempt go to Stripe (a Stripe-origin row's attempts 1 and 2 go elsewhere). */
@@ -257,7 +282,7 @@ async function withPipeline(script: Outcome[], fn: (p: Pipeline) => Promise<void
     table: db.table,
     secrets: {
       stripeWebhookSecret: WEBHOOK_SECRET,
-      adyenHmacKey: "00",
+      adyenHmacKey: ADYEN_HMAC_KEY_HEX,
       braintreePublicKey: "pub",
       braintreePrivateKey: "priv",
     },
@@ -283,6 +308,15 @@ async function withPipeline(script: Outcome[], fn: (p: Pipeline) => Promise<void
           method: "POST",
           headers: { "stripe-signature": `t=${timestamp},v1=${await stripeSignature(timestamp, body)}` },
           body,
+        }),
+      );
+      return { status: res.status, body: await res.json() };
+    },
+    async deliverAdyen(notification) {
+      const res = await webhook(
+        new Request("https://ingest.test/functions/v1/webhook/adyen", {
+          method: "POST",
+          body: JSON.stringify(notification),
         }),
       );
       return { status: res.status, body: await res.json() };
@@ -489,6 +523,52 @@ Deno.test("pipeline: a decline webhook that arrives before the worker records it
     p.clock.advance(DAY);
     assertEquals(okSummary(await p.run()).processed, 0);
     assertEquals(p.net.charges.length, 1);
+  });
+});
+
+Deno.test("pipeline: Stripe's decline of the worker's own retry is acknowledged and not queued", async () => {
+  await withPipeline(["decline"], async (p) => {
+    await ingest(p);
+    await p.routeToStripe();
+    await p.run(); // the worker's create-path PaymentIntent is declined
+    const ownKey = p.net.requests[0].key;
+
+    // Stripe's payment_intent.payment_failed for that PaymentIntent: no
+    // invoice on it, but the worker's metadata.
+    const event = {
+      id: "evt_own_retry",
+      type: "payment_intent.payment_failed",
+      data: {
+        object: {
+          id: "pi_own",
+          amount: 1999,
+          metadata: { syzm_attempt_key: ownKey, syzm_queue_row_id: (await p.row()).id },
+          last_payment_error: { type: "card_error", code: "card_declined", decline_code: "insufficient_funds" },
+        },
+      },
+    };
+    assertEquals(await p.deliver(event), { status: 202, body: { accepted: false, reason: "own_retry" } });
+    assertEquals((await p.db.rows()).length, 1);
+
+    // A customer's own decline for another invoice is still queued.
+    assertEquals((await p.deliver(paymentFailed("evt_customer", "in_2"))).body.accepted, true);
+    assertEquals((await p.db.rows()).length, 2);
+  });
+});
+
+Deno.test("pipeline: Adyen's refusal of the worker's own retry is acknowledged and not queued", async () => {
+  await withPipeline([], async (p) => {
+    const ownKey = "syzm-0b7e2a40-6c5d-4f1e-9a3b-2c1d0e9f8a7b-attempt-2";
+    assertEquals(
+      await p.deliverAdyen(await adyenRefused("PSP_OWN", ownKey)),
+      { status: 202, body: { accepted: false, reason: "own_retry" } },
+    );
+    assertEquals((await p.db.rows()).length, 0);
+
+    // A customer's refused payment with an ordinary reference is queued.
+    assertEquals((await p.deliverAdyen(await adyenRefused("PSP_CUST", "INV-1001"))).body.accepted, true);
+    const rows = await p.db.rows();
+    assertEquals(rows.map((r) => [r.invoice_id, r.processor_origin]), [["INV-1001", "adyen"]]);
   });
 });
 

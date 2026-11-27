@@ -90,6 +90,13 @@ export function attemptIdempotencyKey(row: Pick<QueueRow, "id" | "retry_count">)
   return `syzm-${row.id}-attempt-${row.retry_count + 1}`;
 }
 
+const ATTEMPT_KEY = /^syzm-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-attempt-\d+$/;
+
+/** Whether a reference is one of this worker's attempt keys (attemptIdempotencyKey). */
+export function isAttemptIdempotencyKey(value: unknown): value is string {
+  return typeof value === "string" && ATTEMPT_KEY.test(value);
+}
+
 export type RetryWorkerDeps = {
   table: QueueTable;
   charge: (processor: ProcessorName, attempt: RetryAttempt, correlationId: string) => Promise<RetryResult>;
