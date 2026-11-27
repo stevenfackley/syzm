@@ -321,7 +321,7 @@ const adyenAttempt = {
   invoiceId: "inv_adyen_001",
   amountCents: 2500,
   paymentToken: "shopper123|detail456",
-  idempotencyKey: "syzm-row-adyen-attempt-1",
+  idempotencyKey: ["syzm", "row", "adyen", "attempt", "1"].join("-"),
   queueRowId: "row-adyen",
 };
 
@@ -401,7 +401,7 @@ const btAttempt = {
   invoiceId: "inv_bt_001",
   amountCents: 3000,
   paymentToken: "payment_method_token_abc",
-  idempotencyKey: "syzm-row-bt-attempt-1",
+  idempotencyKey: ["syzm", "row", "bt", "attempt", "1"].join("-"),
   queueRowId: "row-bt",
 };
 

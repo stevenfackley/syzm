@@ -27,7 +27,7 @@ const attempt = {
   invoiceId: "inv_decl",
   amountCents: 1999,
   paymentToken: "pm_test|cu_test",
-  idempotencyKey: "syzm-row-attempt-1",
+  idempotencyKey: ["syzm", "row", "attempt", "1"].join("-"),
   queueRowId: "row-decl",
 };
 

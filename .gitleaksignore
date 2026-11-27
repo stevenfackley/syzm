@@ -1,0 +1,10 @@
+# Findings that are not secrets. One fingerprint per line (commit:file:rule:line).
+#
+# Test fixtures: fake idempotency keys ("syzm-<row>-attempt-<n>") written as
+# quoted literals after a name ending in "Key". The generic-api-key rule reads
+# that shape as an API key. The literals have since been rewritten as joined
+# parts; these lines cover the commits that still carry them.
+60f6907bef519eaa4c675d9416f4f8e82b2966f8:src/ingest/_tests/stripe_declines_test.ts:generic-api-key:32
+4f15393aed1a1bb3c75cef6c493e5c3cc64b581c:src/ingest/_tests/pipeline_test.ts:generic-api-key:561
+60f6907bef519eaa4c675d9416f4f8e82b2966f8:src/ingest/_tests/processors_test.ts:generic-api-key:196
+60f6907bef519eaa4c675d9416f4f8e82b2966f8:src/ingest/_tests/processors_test.ts:generic-api-key:262

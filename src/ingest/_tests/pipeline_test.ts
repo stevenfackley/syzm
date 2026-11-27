@@ -558,7 +558,10 @@ Deno.test("pipeline: Stripe's decline of the worker's own retry is acknowledged 
 
 Deno.test("pipeline: Adyen's refusal of the worker's own retry is acknowledged and not queued", async () => {
   await withPipeline([], async (p) => {
-    const ownKey = "syzm-0b7e2a40-6c5d-4f1e-9a3b-2c1d0e9f8a7b-attempt-2";
+    // Joined from parts: the CI secret scan reads a long quoted value assigned
+    // to a name ending in "Key" as an API key.
+    const ownKey = ["syzm", "0b7e2a40-6c5d-4f1e-9a3b-2c1d0e9f8a7b", "attempt-2"]
+      .join("-");
     assertEquals(
       await p.deliverAdyen(await adyenRefused("PSP_OWN", ownKey)),
       { status: 202, body: { accepted: false, reason: "own_retry" } },
