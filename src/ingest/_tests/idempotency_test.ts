@@ -1,11 +1,10 @@
 /**
  * Tests for idempotency behavior.
  *
- * The DB upsert is handled by Supabase client; we can't run a real DB in unit
- * tests. Instead we verify that:
- *  1. The webhook normalizer extracts a consistent processor_event_id for each
- *     processor so duplicate events produce the same key.
- *  2. The upsert call shape uses onConflict:'processor_event_id' + ignoreDuplicates:true.
+ * The webhook normalizer extracts a consistent processor_event_id for each
+ * processor so duplicate events produce the same key. What the database does
+ * with a duplicate (the insert fails on a unique index and the webhook drops
+ * it) is covered against the real migrations in pipeline_test.ts.
  *
  * We test the extraction logic directly since it is a pure function.
  */
@@ -94,15 +93,4 @@ Deno.test("idempotency: Adyen and Braintree fall back with correlation prefix", 
   assertEquals(extractProcessorEventId("adyen", {}, "c1"), "adyen-unknown-c1");
   assertEquals(extractProcessorEventId("braintree", {}, "c2"), "braintree-unknown-c2");
   assertEquals(extractProcessorEventId("braintree", { id: "bt_id" }, "c3"), "bt_id");
-});
-
-Deno.test("idempotency: upsert shape uses processor_event_id conflict key (documentation test)", () => {
-  // This test documents the contract: the upsert MUST use these parameters.
-  // The actual Supabase client call is in webhook.ts; this validates the expected shape.
-  const expectedOnConflict = "processor_event_id";
-  const expectedIgnoreDuplicates = true;
-
-  // If either changes, a duplicate webhook would insert a duplicate row.
-  assertEquals(expectedOnConflict, "processor_event_id");
-  assertEquals(expectedIgnoreDuplicates, true);
 });

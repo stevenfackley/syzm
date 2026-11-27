@@ -1,10 +1,12 @@
 /**
  * Real payment processor adapters.
  * Uses ONLY tokenized references — no raw card numbers.
- * All calls include an Idempotency-Key to prevent double charges on retry.
+ * Every call sends the attempt's Idempotency-Key (see RetryAttempt), so a
+ * repeat of the same attempt is not charged twice by Stripe or Adyen.
  */
 
-import type { DeclineCategory, ProcessorName } from "./types.ts";
+import { classifyStripeDecline, stripeErrorCode } from "./declines.ts";
+import { type DeclineCategory, NO_RETRY_CATEGORIES, type ProcessorName } from "./types.ts";
 
 // ─── Public types ────────────────────────────────────────────────────────────
 
@@ -21,6 +23,14 @@ export type RetryAttempt = {
    * queue row's `payment_token` column (to be added if not present).
    */
   paymentToken: string;
+  /**
+   * The same for every repeat of one attempt on one queue row and different
+   * for the next attempt (retry-worker.ts attemptIdempotencyKey). At most 64
+   * characters, Adyen's limit.
+   */
+  idempotencyKey: string;
+  /** The queue row being retried; recorded at the processor next to the key. */
+  queueRowId: string;
 };
 
 export type RetryResult = {
@@ -31,7 +41,32 @@ export type RetryResult = {
   processorReference?: string;
   /** Raw processor response code for audit trail. */
   rawDeclineCode?: string;
+  /**
+   * Whether a declined attempt may be tried again. Stripe: the decline table
+   * in declines.ts, which the webhook uses too. Adyen and Braintree: every
+   * category but fraud and lost_stolen (NO_RETRY_CATEGORIES).
+   */
+  retryable: boolean;
+  /**
+   * The answer does not say whether the charge happened: an HTTP status of 500
+   * or above, a 409 (Stripe's answer while another request with the same
+   * idempotency key is in flight), or a body that is not JSON (a gateway or
+   * proxy page). Stripe treats a 500 as indeterminate. The worker handles it
+   * like a network error: it repeats the same attempt under the same key and
+   * never moves on to a new key while the first outcome is unknown.
+   */
+  indeterminate?: boolean;
+  /**
+   * The processor refused the request itself, before looking at the card: a
+   * 401 or 403 (our API key or its permissions) or a 429 (rate limited). No
+   * attempt happened. The worker releases the row without spending an attempt
+   * and tries the same attempt again later.
+   */
+  operational?: boolean;
 };
+
+/** What an adapter returns; retryPayment fills `retryable` when it is left out. */
+type AdapterResult = Omit<RetryResult, "retryable"> & { retryable?: boolean };
 
 // ─── Processor credentials (injected at call time) ───────────────────────────
 
@@ -63,18 +98,22 @@ export async function retryPayment(
     }),
   );
 
-  let result: RetryResult;
+  let adapterResult: AdapterResult;
   switch (processor) {
     case "stripe":
-      result = await retryStripe(attempt, creds, correlationId, fetchImpl);
+      adapterResult = await retryStripe(attempt, creds, fetchImpl);
       break;
     case "adyen":
-      result = await retryAdyen(attempt, creds, correlationId, fetchImpl);
+      adapterResult = await retryAdyen(attempt, creds, fetchImpl);
       break;
     case "braintree":
-      result = await retryBraintree(attempt, creds, correlationId, fetchImpl);
+      adapterResult = await retryBraintree(attempt, creds, fetchImpl);
       break;
   }
+  const result: RetryResult = {
+    ...adapterResult,
+    retryable: adapterResult.retryable ?? !NO_RETRY_CATEGORIES.has(adapterResult.declineCategory),
+  };
 
   console.log(
     JSON.stringify({
@@ -84,6 +123,8 @@ export async function retryPayment(
       ok: result.ok,
       decline_category: result.declineCategory,
       raw_decline_code: result.rawDeclineCode,
+      retryable: result.retryable,
+      indeterminate: result.indeterminate ?? false,
       correlation_id: correlationId,
     }),
   );
@@ -94,7 +135,7 @@ export async function retryPayment(
 /**
  * Parse a processor response body. Returns null when the body is not a JSON
  * object (e.g. an HTML error page from a gateway or proxy) so the caller can
- * report a transient failure instead of throwing.
+ * report an unknown outcome instead of throwing.
  */
 async function readJsonBody(resp: Response): Promise<Record<string, unknown> | null> {
   try {
@@ -105,12 +146,34 @@ async function readJsonBody(resp: Response): Promise<Record<string, unknown> | n
   }
 }
 
-function nonJsonResult(processor: ProcessorName, resp: Response): RetryResult {
+/** A status that does not say whether the charge happened (see RetryResult.indeterminate). */
+function isIndeterminateStatus(resp: Response): boolean {
+  return resp.status >= 500 || resp.status === 409;
+}
+
+/** A status that means the request was refused before any attempt (RetryResult.operational). */
+function isOperationalStatus(resp: Response): boolean {
+  return resp.status === 401 || resp.status === 403 || resp.status === 429;
+}
+
+function operationalFailure(processor: ProcessorName, resp: Response, code?: string): AdapterResult {
+  return {
+    ok: false,
+    processor,
+    declineCategory: "unknown",
+    rawDeclineCode: code ?? `http_${resp.status}`,
+    operational: true,
+  };
+}
+
+/** An answer that does not say whether the charge happened (RetryResult.indeterminate). */
+function unknownOutcome(processor: ProcessorName, rawDeclineCode: string): AdapterResult {
   return {
     ok: false,
     processor,
     declineCategory: "transient",
-    rawDeclineCode: `http_${resp.status}`,
+    rawDeclineCode,
+    indeterminate: true,
   };
 }
 
@@ -125,11 +188,12 @@ const STRIPE_BASE = "https://api.stripe.com/v1";
 async function retryStripe(
   attempt: RetryAttempt,
   creds: ProcessorCredentials,
-  correlationId: string,
   fetchImpl: typeof fetch,
-): Promise<RetryResult> {
+): Promise<AdapterResult> {
   const parts = attempt.paymentToken.split("|");
   if (parts.length < 2) {
+    // Not a Stripe token. Routing sends other processors' rows here too, so
+    // this is not terminal: the row goes on to its own processor.
     return {
       ok: false,
       processor: "stripe",
@@ -138,12 +202,16 @@ async function retryStripe(
     };
   }
 
-  const idempotencyKey = `syzm-retry-${attempt.invoiceId}-stripe-${correlationId}`;
+  const idempotencyKey = attempt.idempotencyKey;
   const authHeader = `Bearer ${creds.stripeApiKey}`;
 
   let url: string;
   let body: URLSearchParams;
 
+  // An attempt that ends with an unknown outcome is reconciled by finding it at
+  // Stripe. A PaymentIntent created here carries the attempt key and the row
+  // id in its metadata. The confirm endpoint takes no metadata, so a confirmed
+  // existing PaymentIntent is found by the Idempotency-Key in Stripe's request log.
   if (parts[0].startsWith("pi_")) {
     // Confirm existing PaymentIntent
     const paymentIntentId = parts[0];
@@ -164,6 +232,8 @@ async function retryStripe(
       payment_method: paymentMethodId,
       confirm: "true",
       off_session: "true",
+      "metadata[syzm_attempt_key]": idempotencyKey,
+      "metadata[syzm_queue_row_id]": attempt.queueRowId,
     });
   }
 
@@ -178,13 +248,11 @@ async function retryStripe(
   });
 
   const json = await readJsonBody(resp);
-  if (!json) return nonJsonResult("stripe", resp);
+  if (!json || isIndeterminateStatus(resp)) return unknownOutcome("stripe", `http_${resp.status}`);
 
   if (resp.ok) {
     const status = json.status as string | undefined;
-    // "processing": Stripe accepted the charge and is still settling it, so it
-    // must not be retried. If it fails later Stripe sends a new payment_failed event.
-    if (status === "succeeded" || status === "processing") {
+    if (status === "succeeded") {
       return {
         ok: true,
         processor: "stripe",
@@ -192,73 +260,45 @@ async function retryStripe(
         processorReference: json.id as string,
       };
     }
-    // requires_action / requires_payment_method → needs auth
+    // "processing": Stripe has not finished; the payment can still fail. Not a
+    // recovery and not a decline: the same attempt is asked again later.
+    if (status === "processing") return unknownOutcome("stripe", "processing");
+    // requires_action / requires_payment_method → needs the customer to
+    // authenticate or pay another way; Stripe lists authentication_required
+    // as a hard decline (declines.ts).
     if (status === "requires_action" || status === "requires_payment_method") {
       return {
         ok: false,
         processor: "stripe",
         declineCategory: "authentication_required",
         rawDeclineCode: status,
+        retryable: false,
       };
     }
   }
 
   // Error path
   const err = (json.error ?? {}) as Record<string, unknown>;
-  const rawCode = String(err.decline_code ?? err.code ?? "unknown");
+  // An idempotency_error (for example the same key sent with different
+  // parameters) says nothing about the first request under that key.
+  if (err.type === "idempotency_error") return unknownOutcome("stripe", "idempotency_error");
+  const rawCode = stripeErrorCode(err) ?? "unknown";
+  if (isOperationalStatus(resp)) return operationalFailure("stripe", resp, rawCode);
+
+  // Only a card error is a decline; the decline table is for those codes.
+  // Other errors (invalid_request_error, api_error) are not classified by the
+  // table or its keywords: api_key_expired is not an expired card.
+  if (err.type !== "card_error" && resp.status !== 402) {
+    return { ok: false, processor: "stripe", declineCategory: "unknown", rawDeclineCode: rawCode };
+  }
+  const decline = classifyStripeDecline(rawCode);
   return {
     ok: false,
     processor: "stripe",
-    declineCategory: mapStripeDeclineCode(rawCode),
+    declineCategory: decline.category,
     rawDeclineCode: rawCode,
+    retryable: decline.retryable,
   };
-}
-
-/**
- * Stripe decline codes that the retry worker (mapStripeDeclineCode) and the
- * webhook (mapRawCodeToCategory in normalize.ts) classify the same way.
- * Lookups are exact and case-sensitive.
- */
-export const STRIPE_DECLINE_CATEGORIES: ReadonlyMap<string, DeclineCategory> = new Map<
-  string,
-  DeclineCategory
->([
-  ["insufficient_funds", "insufficient_funds"],
-  ["do_not_honor", "do_not_honor"],
-  ["lost_card", "lost_stolen"],
-  ["stolen_card", "lost_stolen"],
-  ["fraudulent", "fraud"],
-  ["fraud", "fraud"],
-  ["expired_card", "expired_card"],
-  ["incorrect_number", "invalid_data"],
-  ["invalid_number", "invalid_data"],
-  ["issuer_not_available", "transient"],
-  ["processing_error", "transient"],
-  ["card_velocity_exceeded", "velocity"],
-  ["withdrawal_count_limit_exceeded", "velocity"],
-  ["authentication_required", "authentication_required"],
-]);
-
-/**
- * Stripe codes only the retry worker classifies. The webhook sends each of these
- * through its substring rules and gets a different answer (noted per row; see
- * _tests/stripe_declines_test.ts). Which side is right is an open owner decision.
- */
-const STRIPE_RETRY_ONLY_CATEGORIES: ReadonlyMap<string, DeclineCategory> = new Map<
-  string,
-  DeclineCategory
->([
-  ["card_decline_rate_limit_exceeded", "insufficient_funds"], // webhook: velocity
-  ["generic_decline", "do_not_honor"], // webhook: unknown
-  ["card_declined", "do_not_honor"], // webhook: unknown
-  ["invalid_expiry_month", "invalid_data"], // webhook: unknown
-  ["invalid_expiry_year", "invalid_data"], // webhook: unknown
-  ["invalid_cvc", "invalid_data"], // webhook: unknown
-  ["try_again_later", "transient"], // webhook: unknown
-]);
-
-function mapStripeDeclineCode(code: string): DeclineCategory {
-  return STRIPE_DECLINE_CATEGORIES.get(code) ?? STRIPE_RETRY_ONLY_CATEGORIES.get(code) ?? "unknown";
 }
 
 // ─── Adyen ───────────────────────────────────────────────────────────────────
@@ -271,9 +311,8 @@ const ADYEN_BASE = "https://checkout-test.adyen.com/v71";
 async function retryAdyen(
   attempt: RetryAttempt,
   creds: ProcessorCredentials,
-  correlationId: string,
   fetchImpl: typeof fetch,
-): Promise<RetryResult> {
+): Promise<AdapterResult> {
   const parts = attempt.paymentToken.split("|");
   if (parts.length < 2) {
     return {
@@ -285,7 +324,7 @@ async function retryAdyen(
   }
 
   const [shopperReference, recurringDetailReference] = parts;
-  const idempotencyKey = `syzm-retry-${attempt.invoiceId}-adyen-${correlationId}`;
+  const idempotencyKey = attempt.idempotencyKey;
 
   const payload = {
     merchantAccount: creds.adyenMerchantAccount,
@@ -311,7 +350,8 @@ async function retryAdyen(
   });
 
   const json = await readJsonBody(resp);
-  if (!json) return nonJsonResult("adyen", resp);
+  if (!json || isIndeterminateStatus(resp)) return unknownOutcome("adyen", `http_${resp.status}`);
+  if (isOperationalStatus(resp)) return operationalFailure("adyen", resp);
   const resultCode = String(json.resultCode ?? "");
   const refusalReason = String(json.refusalReason ?? "");
 
@@ -322,6 +362,12 @@ async function retryAdyen(
       declineCategory: "unknown",
       processorReference: String(json.pspReference ?? ""),
     };
+  }
+
+  // Received and Pending are intermediate: Adyen has not decided, and the
+  // payment can still be authorised.
+  if (resultCode === "Received" || resultCode === "Pending") {
+    return unknownOutcome("adyen", resultCode);
   }
 
   return {
@@ -364,11 +410,10 @@ const BRAINTREE_BASE = "https://payments.sandbox.braintree-api.com/graphql";
 async function retryBraintree(
   attempt: RetryAttempt,
   creds: ProcessorCredentials,
-  correlationId: string,
   fetchImpl: typeof fetch,
-): Promise<RetryResult> {
+): Promise<AdapterResult> {
   const paymentMethodToken = attempt.paymentToken;
-  const idempotencyKey = `syzm-retry-${attempt.invoiceId}-bt-${correlationId}`;
+  const idempotencyKey = attempt.idempotencyKey;
 
   const amountDollars = (attempt.amountCents / 100).toFixed(2);
 
@@ -411,6 +456,10 @@ async function retryBraintree(
     body: JSON.stringify({ query, variables }),
   });
 
+  const json = await readJsonBody(resp);
+  if (!json || isIndeterminateStatus(resp)) return unknownOutcome("braintree", `http_${resp.status}`);
+  if (isOperationalStatus(resp)) return operationalFailure("braintree", resp);
+
   if (!resp.ok) {
     return {
       ok: false,
@@ -420,11 +469,15 @@ async function retryBraintree(
     };
   }
 
-  const json = await readJsonBody(resp);
-  if (!json) return nonJsonResult("braintree", resp);
-
   const errors = (json.errors as unknown[] | undefined);
   if (errors && errors.length > 0) {
+    // An INTERNAL or SERVICE_AVAILABILITY error says nothing about whether the
+    // charge ran; the other classes (validation, not found, ...) reject it.
+    const errorClasses = errors.map((e) =>
+      String(((e as Record<string, unknown>)?.extensions as Record<string, unknown> | undefined)?.errorClass ?? "")
+    );
+    const unclear = errorClasses.find((c) => BRAINTREE_UNCLEAR_ERROR_CLASSES.has(c));
+    if (unclear) return unknownOutcome("braintree", `graphql_${unclear}`);
     return {
       ok: false,
       processor: "braintree",
@@ -436,14 +489,7 @@ async function retryBraintree(
   const data = json.data as Record<string, unknown> | undefined;
   const tx = (data?.chargeVaultedPaymentMethod as Record<string, unknown> | undefined)?.transaction as Record<string, unknown> | undefined;
 
-  if (!tx) {
-    return {
-      ok: false,
-      processor: "braintree",
-      declineCategory: "transient",
-      rawDeclineCode: "no_transaction_in_response",
-    };
-  }
+  if (!tx) return unknownOutcome("braintree", "no_transaction_in_response");
 
   const status = String(tx.status ?? "");
   const processorResponse = (tx.processorResponse ?? {}) as Record<string, unknown>;
@@ -459,6 +505,11 @@ async function retryBraintree(
     };
   }
 
+  // Only a status that says no money moved is a decline. Anything else
+  // (AUTHORIZING, SETTLING, SETTLEMENT_PENDING, a status this adapter does not
+  // know) is still in progress or unclear.
+  if (!BRAINTREE_DECLINED_STATUSES.has(status)) return unknownOutcome("braintree", `status_${status || "missing"}`);
+
   return {
     ok: false,
     processor: "braintree",
@@ -466,6 +517,19 @@ async function retryBraintree(
     rawDeclineCode: `${legacyCode}:${message}`,
   };
 }
+
+/** Transaction statuses after which no money moved. */
+const BRAINTREE_DECLINED_STATUSES: ReadonlySet<string> = new Set([
+  "PROCESSOR_DECLINED",
+  "GATEWAY_REJECTED",
+  "FAILED",
+  "SETTLEMENT_DECLINED",
+  "VOIDED",
+  "AUTHORIZATION_EXPIRED",
+]);
+
+/** GraphQL error classes that do not say whether the request ran. */
+const BRAINTREE_UNCLEAR_ERROR_CLASSES: ReadonlySet<string> = new Set(["INTERNAL", "SERVICE_AVAILABILITY"]);
 
 function mapBraintreeResponseCode(legacyCode: string, message: string): DeclineCategory {
   // Braintree processor response codes: https://developer.paypal.com/braintree/docs/reference/general/processor-responses

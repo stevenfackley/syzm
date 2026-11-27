@@ -45,7 +45,7 @@ Open `http://localhost:3000`.
 
 ## 3) SQL Bootstrap
 
-Apply `src/sql/001` through `src/sql/007` in order. See [`src/sql/README.md`](src/sql/README.md) for details: `002_cron.sql` holds placeholder literals and is superseded by `005_cron_parameterized.sql`, which needs the Vault secrets registered first.
+Apply `src/sql/001` through `src/sql/008` in order. See [`src/sql/README.md`](src/sql/README.md) for details: `002_cron.sql` holds placeholder literals and is superseded by `005_cron_parameterized.sql`, which needs the Vault secrets registered first.
 
 ## Configuration
 
