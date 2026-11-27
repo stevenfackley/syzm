@@ -11,20 +11,31 @@ Apply in order.  Each migration is idempotent (uses `IF NOT EXISTS`, `ON CONFLIC
 | 5 | `005_cron_parameterized.sql` | Replaces the 002 placeholder job; reads URL + key from Vault |
 | 6 | `006_dashboard_views.sql` | `syzm_dashboard_metrics` + `syzm_decline_intelligence` views |
 | 7 | `007_reconcile_ingest_columns.sql` | `payment_token` + normalized `decline_category` columns used by ingest |
+| 8 | `008_retry_pipeline_states.sql` | `correlation_id`, claim columns, the statuses and retry count the worker writes, one row per invoice |
 
 ---
 
-## Idempotency (003)
+## Idempotency (003, 008)
 
-The ingest layer MUST supply `processor_event_id` (the upstream webhook event id, e.g. Stripe `evt_xxx`) on every INSERT:
+The ingest layer MUST supply `processor_event_id` (the upstream webhook event id, e.g. Stripe `evt_xxx`) on every INSERT. It inserts plainly and treats a unique violation (`23505`) as a duplicate:
 
 ```sql
 INSERT INTO syzm_recovery_queue (invoice_id, ..., processor_event_id, tenant_id, ...)
-VALUES (...)
-ON CONFLICT (processor_event_id) DO NOTHING;
+VALUES (...);
+-- 23505 -> the webhook answers 202 { accepted: false, reason: "duplicate" }
 ```
 
-A second webhook delivery for the same event is silently dropped.  A secondary composite index on `(invoice_id, retry_count) WHERE status IN ('pending','retrying')` prevents a concurrent second insert from enqueuing the same retry depth.
+`ON CONFLICT (processor_event_id)` does not work here: the 003 index is partial (`WHERE processor_event_id IS NOT NULL`), and Postgres only infers a partial index when the conflict clause repeats its predicate, which PostgREST's `on_conflict` cannot send.
+
+Two indexes raise the violation: the 003 index on `processor_event_id` (a redelivery of the same event), and the 008 index on `(tenant_id, processor_origin, invoice_id)` (any later event for an invoice that already has a row, in any status). The second one is what keeps the processor's webhook for a retry the worker just made from opening a second retry sequence for the same invoice. The 003 composite index on `(invoice_id, retry_count) WHERE status IN ('pending','retrying')` is still there and now redundant.
+
+## Retry claims (008)
+
+The retry worker claims a due row before charging it: `status` goes from `pending` to `retrying` and `claimed_at` / `attempt_started_at` are set, in one conditional update, so two overlapping runs cannot charge the same row. The charge carries an idempotency key made of the row id and the attempt number. The outcome is written only while the claim is held, and clears both claim columns.
+
+A run that dies after the claim leaves the row `retrying`. Once `claimed_at` is 15 minutes old a later run takes the row over and repeats the attempt with the same key, so a charge that went through but was never recorded is answered from the processor's record, not charged again. That happens only for Stripe and Adyen, and only within 23 hours of `attempt_started_at` (Stripe drops keys after 24 hours). Otherwise the row ends `error` with `schedule_reason = 'stale_claim_not_repeatable:<processor>'` and needs reconciling by hand.
+
+`retry_count` counts attempts made: `0`-`4`, and `4` only on a finished row (`recovered`, `exhausted`, `blocked`, `error`).
 
 ---
 

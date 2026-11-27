@@ -1,7 +1,8 @@
 /**
  * Real payment processor adapters.
  * Uses ONLY tokenized references — no raw card numbers.
- * All calls include an Idempotency-Key to prevent double charges on retry.
+ * Every call sends the attempt's Idempotency-Key (see RetryAttempt), so a
+ * repeat of the same attempt is not charged twice by Stripe or Adyen.
  */
 
 import type { DeclineCategory, ProcessorName } from "./types.ts";
@@ -21,6 +22,12 @@ export type RetryAttempt = {
    * queue row's `payment_token` column (to be added if not present).
    */
   paymentToken: string;
+  /**
+   * The same for every repeat of one attempt on one queue row and different
+   * for the next attempt (retry-worker.ts attemptIdempotencyKey). At most 64
+   * characters, Adyen's limit.
+   */
+  idempotencyKey: string;
 };
 
 export type RetryResult = {
@@ -66,13 +73,13 @@ export async function retryPayment(
   let result: RetryResult;
   switch (processor) {
     case "stripe":
-      result = await retryStripe(attempt, creds, correlationId, fetchImpl);
+      result = await retryStripe(attempt, creds, fetchImpl);
       break;
     case "adyen":
-      result = await retryAdyen(attempt, creds, correlationId, fetchImpl);
+      result = await retryAdyen(attempt, creds, fetchImpl);
       break;
     case "braintree":
-      result = await retryBraintree(attempt, creds, correlationId, fetchImpl);
+      result = await retryBraintree(attempt, creds, fetchImpl);
       break;
   }
 
@@ -125,7 +132,6 @@ const STRIPE_BASE = "https://api.stripe.com/v1";
 async function retryStripe(
   attempt: RetryAttempt,
   creds: ProcessorCredentials,
-  correlationId: string,
   fetchImpl: typeof fetch,
 ): Promise<RetryResult> {
   const parts = attempt.paymentToken.split("|");
@@ -138,7 +144,7 @@ async function retryStripe(
     };
   }
 
-  const idempotencyKey = `syzm-retry-${attempt.invoiceId}-stripe-${correlationId}`;
+  const idempotencyKey = attempt.idempotencyKey;
   const authHeader = `Bearer ${creds.stripeApiKey}`;
 
   let url: string;
@@ -271,7 +277,6 @@ const ADYEN_BASE = "https://checkout-test.adyen.com/v71";
 async function retryAdyen(
   attempt: RetryAttempt,
   creds: ProcessorCredentials,
-  correlationId: string,
   fetchImpl: typeof fetch,
 ): Promise<RetryResult> {
   const parts = attempt.paymentToken.split("|");
@@ -285,7 +290,7 @@ async function retryAdyen(
   }
 
   const [shopperReference, recurringDetailReference] = parts;
-  const idempotencyKey = `syzm-retry-${attempt.invoiceId}-adyen-${correlationId}`;
+  const idempotencyKey = attempt.idempotencyKey;
 
   const payload = {
     merchantAccount: creds.adyenMerchantAccount,
@@ -364,11 +369,10 @@ const BRAINTREE_BASE = "https://payments.sandbox.braintree-api.com/graphql";
 async function retryBraintree(
   attempt: RetryAttempt,
   creds: ProcessorCredentials,
-  correlationId: string,
   fetchImpl: typeof fetch,
 ): Promise<RetryResult> {
   const paymentMethodToken = attempt.paymentToken;
-  const idempotencyKey = `syzm-retry-${attempt.invoiceId}-bt-${correlationId}`;
+  const idempotencyKey = attempt.idempotencyKey;
 
   const amountDollars = (attempt.amountCents / 100).toFixed(2);
 

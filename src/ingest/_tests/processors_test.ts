@@ -5,7 +5,7 @@
  * ok=true on success, ok=false with correct category on various declines.
  */
 
-import { assertEquals, assertStringIncludes } from "https://deno.land/std@0.224.0/assert/mod.ts";
+import { assertEquals } from "https://deno.land/std@0.224.0/assert/mod.ts";
 import { retryPayment, type ProcessorCredentials } from "../_shared/processors.ts";
 
 // ─── Test credentials ────────────────────────────────────────────────────────
@@ -23,6 +23,7 @@ const attempt = {
   invoiceId: "inv_test_001",
   amountCents: 1999,
   paymentToken: "pm_test|cu_test",
+  idempotencyKey: "syzm-row-stripe-attempt-1",
 };
 
 // ─── Fetch mock helper ────────────────────────────────────────────────────────
@@ -67,7 +68,7 @@ Deno.test("Stripe: non-JSON error page returns transient instead of throwing", a
 Deno.test("Adyen: non-JSON error page returns transient instead of throwing", async () => {
   const result = await retryPayment(
     "adyen",
-    { invoiceId: "inv_adyen_html", amountCents: 2500, paymentToken: "shopper123|detail456" },
+    { invoiceId: "inv_adyen_html", amountCents: 2500, paymentToken: "shopper123|detail456", idempotencyKey: "k-adyen-html" },
     creds,
     "corr-html-2",
     makeHtmlFetchMock(502),
@@ -79,7 +80,7 @@ Deno.test("Adyen: non-JSON error page returns transient instead of throwing", as
 });
 
 Deno.test("Braintree: non-JSON error page returns transient instead of throwing", async () => {
-  const btHtmlAttempt = { invoiceId: "inv_bt_html", amountCents: 3000, paymentToken: "pmt_abc" };
+  const btHtmlAttempt = { invoiceId: "inv_bt_html", amountCents: 3000, paymentToken: "pmt_abc", idempotencyKey: "k-bt-html" };
 
   const on502 = await retryPayment("braintree", btHtmlAttempt, creds, "corr-html-3", makeHtmlFetchMock(502));
   assertEquals(on502.ok, false);
@@ -105,16 +106,16 @@ Deno.test("Stripe: approved PaymentIntent returns ok=true", async () => {
   assertEquals(result.processorReference, "pi_test");
 });
 
-Deno.test("Stripe: sends Idempotency-Key header", async () => {
+Deno.test("Stripe: sends the attempt's Idempotency-Key header, whatever the correlation id", async () => {
   const captured: Request[] = [];
   const mockFetch = makeFetchMock({ id: "pi_test", status: "succeeded" }, 200, captured);
 
   await retryPayment("stripe", attempt, creds, "corr-idempotent", mockFetch);
+  await retryPayment("stripe", attempt, creds, "corr-other-run", mockFetch);
 
-  assertEquals(captured.length > 0, true);
-  const idempKey = captured[0].headers.get("Idempotency-Key");
-  assertStringIncludes(idempKey ?? "", "inv_test_001");
-  assertStringIncludes(idempKey ?? "", "stripe");
+  assertEquals(captured.length, 2);
+  assertEquals(captured[0].headers.get("Idempotency-Key"), attempt.idempotencyKey);
+  assertEquals(captured[1].headers.get("Idempotency-Key"), attempt.idempotencyKey);
 });
 
 Deno.test("Stripe: insufficient_funds decline maps correctly", async () => {
@@ -192,6 +193,7 @@ const adyenAttempt = {
   invoiceId: "inv_adyen_001",
   amountCents: 2500,
   paymentToken: "shopper123|detail456",
+  idempotencyKey: "syzm-row-adyen-attempt-1",
 };
 
 Deno.test("Adyen: Authorised result returns ok=true", async () => {
@@ -208,14 +210,14 @@ Deno.test("Adyen: Authorised result returns ok=true", async () => {
   assertEquals(result.processorReference, "psp_abc");
 });
 
-Deno.test("Adyen: sends Idempotency-Key header", async () => {
+Deno.test("Adyen: sends the attempt's Idempotency-Key header and uses it as the reference", async () => {
   const captured: Request[] = [];
   const mockFetch = makeFetchMock({ resultCode: "Authorised", pspReference: "p" }, 200, captured);
 
   await retryPayment("adyen", adyenAttempt, creds, "corr-adyen-key", mockFetch);
 
-  const idempKey = captured[0].headers.get("Idempotency-Key");
-  assertStringIncludes(idempKey ?? "", "inv_adyen_001");
+  assertEquals(captured[0].headers.get("Idempotency-Key"), adyenAttempt.idempotencyKey);
+  assertEquals((await captured[0].json()).reference, adyenAttempt.idempotencyKey);
 });
 
 Deno.test("Adyen: Refused with insufficient funds maps correctly", async () => {
@@ -257,6 +259,7 @@ const btAttempt = {
   invoiceId: "inv_bt_001",
   amountCents: 3000,
   paymentToken: "payment_method_token_abc",
+  idempotencyKey: "syzm-row-bt-attempt-1",
 };
 
 Deno.test("Braintree: SUBMITTED_FOR_SETTLEMENT returns ok=true", async () => {
@@ -303,8 +306,7 @@ Deno.test("Braintree: sends Idempotency-Key header", async () => {
 
   await retryPayment("braintree", btAttempt, creds, "corr-bt-key", mockFetch);
 
-  const idempKey = captured[0].headers.get("Idempotency-Key");
-  assertStringIncludes(idempKey ?? "", "inv_bt_001");
+  assertEquals(captured[0].headers.get("Idempotency-Key"), btAttempt.idempotencyKey);
 });
 
 Deno.test("Braintree: code 2001 (insufficient funds) maps correctly", async () => {

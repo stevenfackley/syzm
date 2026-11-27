@@ -25,7 +25,12 @@ const creds: ProcessorCredentials = {
   braintreeMerchantId: "merchant1",
 };
 
-const attempt = { invoiceId: "inv_decl", amountCents: 1999, paymentToken: "pm_test|cu_test" };
+const attempt = {
+  invoiceId: "inv_decl",
+  amountCents: 1999,
+  paymentToken: "pm_test|cu_test",
+  idempotencyKey: "syzm-row-attempt-1",
+};
 
 function stripeError(error: Record<string, unknown> | undefined): typeof fetch {
   return (async () =>

@@ -1,0 +1,542 @@
+/**
+ * The retry pipeline end to end against the committed migrations
+ * (_pipeline_db.ts): a signed Stripe decline webhook creates the queue row,
+ * worker runs charge it through the real processor adapters, and a fake
+ * processor network answers them. The fake charges once per idempotency key on
+ * Stripe and Adyen, which answer a repeated key from their record of the first
+ * request, and on every request on Braintree.
+ *
+ * Nothing writes payment_token yet (an open owner decision), so each test sets
+ * one on the row after the webhook has created it.
+ */
+
+import { assertEquals, assertRejects } from "https://deno.land/std@0.224.0/assert/mod.ts";
+
+import { type ProcessorCredentials, retryPayment } from "../_shared/processors.ts";
+import type { QueueTable } from "../_shared/queue.ts";
+import { CLAIM_STALE_AFTER_MS, runRetryBatch } from "../_shared/retry-worker.ts";
+import type { ProcessorName } from "../_shared/types.ts";
+import { createWebhookHandler } from "../_shared/webhook-handler.ts";
+import { MIGRATIONS, openPipelineDb, type PipelineDb } from "./_pipeline_db.ts";
+
+const MINUTE = 60 * 1000;
+const DAY = 24 * 60 * MINUTE;
+/** A Friday afternoon, well outside the Sunday 05:00-08:00 UTC blackout. */
+const T0 = Date.parse("2026-11-27T15:00:00.000Z");
+const WEBHOOK_SECRET = "whsec_pipeline_test";
+
+const creds: ProcessorCredentials = {
+  stripeApiKey: "sk_test_pipeline",
+  adyenApiKey: "adyen_test_key",
+  adyenMerchantAccount: "TestMerchant",
+  braintreePublicKey: "pub",
+  braintreePrivateKey: "priv",
+  braintreeMerchantId: "merchant1",
+};
+
+// ─── Fake processor network ──────────────────────────────────────────────────
+
+type Outcome = "approve" | "decline";
+type Answer = { status: number; body: unknown };
+
+function render(processor: ProcessorName, outcome: Outcome, n: number): Answer {
+  switch (processor) {
+    case "stripe":
+      return outcome === "approve"
+        ? { status: 200, body: { id: `pi_${n}`, status: "succeeded" } }
+        : { status: 402, body: { error: { code: "card_declined", decline_code: "insufficient_funds" } } };
+    case "adyen":
+      return outcome === "approve"
+        ? { status: 200, body: { resultCode: "Authorised", pspReference: `psp_${n}` } }
+        : { status: 200, body: { resultCode: "Refused", refusalReason: "Not enough balance" } };
+    case "braintree": {
+      const transaction = outcome === "approve"
+        ? { id: `bt_${n}`, status: "SUBMITTED_FOR_SETTLEMENT", processorResponse: { legacyCode: "1000", message: "Approved" } }
+        : { id: `bt_${n}`, status: "PROCESSOR_DECLINED", processorResponse: { legacyCode: "2001", message: "Insufficient Funds" } };
+      return { status: 200, body: { data: { chargeVaultedPaymentMethod: { transaction } } } };
+    }
+  }
+}
+
+class ProcessorNetwork {
+  /** Money that moved: one entry per approved charge. */
+  readonly charges: Array<{ processor: ProcessorName; key: string }> = [];
+  readonly requests: Array<{ processor: ProcessorName; key: string }> = [];
+  private readonly remembered = new Map<string, Answer>();
+  /** Runs inside the next charge request, after the processor acted and before it answers. */
+  duringNextCharge?: () => Promise<void>;
+  /** The next answer is lost on the way back (the processor did act). */
+  loseNextAnswer = false;
+
+  constructor(private readonly script: Outcome[]) {}
+
+  readonly fetch = (async (input: Request | URL | string, init?: RequestInit) => {
+    const url = String(input instanceof Request ? input.url : input);
+    const processor: ProcessorName = url.includes("stripe.com")
+      ? "stripe"
+      : url.includes("adyen.com")
+      ? "adyen"
+      : "braintree";
+    const key = new Headers(init?.headers).get("Idempotency-Key") ?? "";
+    this.requests.push({ processor, key });
+
+    let answer = processor === "braintree" ? undefined : this.remembered.get(`${processor} ${key}`);
+    if (!answer) {
+      const outcome = this.script.shift();
+      if (!outcome) throw new Error(`no scripted outcome left for ${processor}`);
+      if (outcome === "approve") this.charges.push({ processor, key });
+      answer = render(processor, outcome, this.requests.length);
+      if (processor !== "braintree") this.remembered.set(`${processor} ${key}`, answer);
+    }
+
+    const hook = this.duringNextCharge;
+    this.duringNextCharge = undefined;
+    if (hook) await hook();
+    if (this.loseNextAnswer) {
+      this.loseNextAnswer = false;
+      throw new TypeError("connection reset by peer");
+    }
+    return new Response(JSON.stringify(answer.body), {
+      status: answer.status,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+}
+
+// ─── Webhook delivery ────────────────────────────────────────────────────────
+
+const enc = new TextEncoder();
+
+async function stripeSignature(timestamp: string, body: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(WEBHOOK_SECRET),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(`${timestamp}.${body}`));
+  return Array.from(new Uint8Array(sig)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function paymentFailed(eventId: string, invoiceId: string, declineCode = "insufficient_funds") {
+  return {
+    id: eventId,
+    type: "payment_intent.payment_failed",
+    data: { object: { invoice: invoiceId, amount_due: 1999, last_payment_error: { decline_code: declineCode } } },
+  };
+}
+
+// ─── Harness ─────────────────────────────────────────────────────────────────
+
+type Pipeline = {
+  db: PipelineDb;
+  net: ProcessorNetwork;
+  clock: { now: () => Date; advance(ms: number): void };
+  deliver(event: unknown): Promise<{ status: number; body: Record<string, unknown> }>;
+  run(table?: QueueTable): ReturnType<typeof runRetryBatch>;
+  giveToken(): Promise<void>;
+  row(): Promise<Record<string, unknown>>;
+};
+
+async function withPipeline(script: Outcome[], fn: (p: Pipeline) => Promise<void>): Promise<void> {
+  const db = await openPipelineDb();
+  const net = new ProcessorNetwork(script);
+  let t = T0;
+  const clock = { now: () => new Date(t), advance: (ms: number) => void (t += ms) };
+
+  const webhook = createWebhookHandler({
+    table: db.table,
+    secrets: {
+      stripeWebhookSecret: WEBHOOK_SECRET,
+      adyenHmacKey: "00",
+      braintreePublicKey: "pub",
+      braintreePrivateKey: "priv",
+    },
+    schedule: (decline) =>
+      Promise.resolve({
+        invoice_id: decline.invoice_id,
+        scheduled_at_utc: clock.now().toISOString(),
+        reason: "test_schedule",
+        strategy_version: "test",
+        eligible_processors: [],
+      }),
+  });
+
+  const pipeline: Pipeline = {
+    db,
+    net,
+    clock,
+    async deliver(event) {
+      const body = JSON.stringify(event);
+      const timestamp = String(Math.floor(Date.now() / 1000));
+      const res = await webhook(
+        new Request("https://ingest.test/functions/v1/webhook/stripe", {
+          method: "POST",
+          headers: { "stripe-signature": `t=${timestamp},v1=${await stripeSignature(timestamp, body)}` },
+          body,
+        }),
+      );
+      return { status: res.status, body: await res.json() };
+    },
+    run: (table = db.table) =>
+      runRetryBatch({
+        table,
+        charge: (processor, attempt, correlationId) => retryPayment(processor, attempt, creds, correlationId, net.fetch),
+        schedule: () => Promise.resolve(new Date(clock.now().getTime() + DAY).toISOString()),
+        correlationId: "batch-test",
+        now: clock.now,
+      }),
+    async giveToken() {
+      await db.db.exec("UPDATE syzm_recovery_queue SET payment_token = 'pm_1|cus_1' WHERE payment_token IS NULL");
+    },
+    async row() {
+      const rows = await db.rows();
+      assertEquals(rows.length, 1, "one queue row");
+      return rows[0];
+    },
+  };
+
+  try {
+    await fn(pipeline);
+  } finally {
+    await db.close();
+  }
+}
+
+/** Ingest one decline and make the row chargeable. */
+async function ingest(p: Pipeline, invoiceId = "in_1"): Promise<void> {
+  const res = await p.deliver(paymentFailed("evt_1", invoiceId));
+  assertEquals(res, { status: 202, body: { accepted: true, scheduled_at_utc: new Date(T0).toISOString() } });
+  await p.giveToken();
+}
+
+/** A table that dies (like a killed worker) on the write that records an attempt. */
+function crashingOnRecord(table: QueueTable): QueueTable {
+  return {
+    ...table,
+    update(patch, filter) {
+      if (patch.attempt_started_at === null && filter.eq?.status === "retrying") {
+        throw new Error("worker killed before recording the attempt");
+      }
+      return table.update(patch, filter);
+    },
+  };
+}
+
+function okSummary(result: Awaited<ReturnType<typeof runRetryBatch>>) {
+  if (!result.ok) throw new Error(`run failed: ${result.error}`);
+  return result.summary;
+}
+
+// ─── Schema ──────────────────────────────────────────────────────────────────
+
+Deno.test("pipeline: the migrations apply in order, and 008 applies twice", async () => {
+  const db = await openPipelineDb();
+  try {
+    await db.db.exec(MIGRATIONS[MIGRATIONS.length - 1][1]);
+  } finally {
+    await db.close();
+  }
+});
+
+Deno.test("pipeline: without 008 the schema rejects what the webhook and the worker write", async () => {
+  const db = await openPipelineDb(MIGRATIONS.length - 1);
+  try {
+    const select = await db.table.select(["id", "correlation_id"], { eq: { status: "pending" } }, 1);
+    assertEquals(select.error?.code, "42703"); // undefined_column: the worker's due-row select
+    const insert = await db.table.insert({
+      invoice_id: "in_old",
+      processor_event_id: "evt_old",
+      scheduled_at: new Date(T0).toISOString(),
+      processor_origin: "stripe",
+      correlation_id: "c",
+    });
+    assertEquals(insert.error?.code, "42703"); // the webhook's insert
+
+    await db.db.exec(
+      `INSERT INTO syzm_recovery_queue (invoice_id, retry_count, scheduled_at, processor_origin)
+       VALUES ('in_old', 3, now(), 'stripe')`,
+    );
+    for (const status of ["recovered", "exhausted"]) {
+      const write = await db.table.update({ status, retry_count: 4 }, { eq: { invoice_id: "in_old" } });
+      assertEquals(write.error?.code, "23514", status); // check_violation: retry_count < 4
+    }
+    for (const status of ["blocked", "error"]) {
+      const write = await db.table.update({ status }, { eq: { invoice_id: "in_old" } });
+      assertEquals(write.error?.code, "23514", status); // check_violation: status list
+    }
+  } finally {
+    await db.close();
+  }
+});
+
+// ─── Charges ─────────────────────────────────────────────────────────────────
+
+Deno.test("pipeline: success on attempt 1 is recorded once and never dispatched again", async () => {
+  await withPipeline(["approve"], async (p) => {
+    await ingest(p);
+
+    const first = okSummary(await p.run());
+    assertEquals([first.processed, first.recovered], [1, 1]);
+    const row = await p.row();
+    assertEquals([row.status, row.retry_count, row.claimed_at, row.attempt_started_at], ["recovered", 1, null, null]);
+    assertEquals(typeof row.processor_reference, "string");
+
+    for (let i = 0; i < 3; i++) {
+      p.clock.advance(DAY);
+      assertEquals(okSummary(await p.run()).processed, 0);
+    }
+    assertEquals(p.net.charges.length, 1);
+    assertEquals(p.net.requests.length, 1);
+  });
+});
+
+Deno.test("pipeline: success on the fourth (last allowed) attempt is recorded and never dispatched again", async () => {
+  await withPipeline(["decline", "decline", "decline", "approve"], async (p) => {
+    await ingest(p);
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      assertEquals(okSummary(await p.run()).rescheduled, 1, `attempt ${attempt}`);
+      const row = await p.row();
+      assertEquals([row.status, row.retry_count], ["pending", attempt]);
+      p.clock.advance(DAY);
+    }
+
+    assertEquals(okSummary(await p.run()).recovered, 1);
+    const row = await p.row();
+    assertEquals([row.status, row.retry_count], ["recovered", 4]);
+    assertEquals(row.processor_history, ["stripe", "adyen", "braintree", "stripe", "stripe"]);
+
+    for (let i = 0; i < 3; i++) {
+      p.clock.advance(MINUTE);
+      assertEquals(okSummary(await p.run()).processed, 0);
+    }
+    assertEquals(p.net.charges.length, 1);
+    assertEquals(p.net.requests.length, 4);
+    // Each attempt went out under its own key; attempts 3 and 4 both go to Stripe.
+    assertEquals(new Set(p.net.requests.map((r) => r.key)).size, 4);
+  });
+});
+
+Deno.test("pipeline: a decline on every attempt ends exhausted after four and is never dispatched again", async () => {
+  await withPipeline(["decline", "decline", "decline", "decline"], async (p) => {
+    await ingest(p);
+
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      await p.run();
+      p.clock.advance(DAY);
+    }
+    const row = await p.row();
+    assertEquals([row.status, row.retry_count, row.last_decline_code], ["exhausted", 4, "insufficient_funds"]);
+
+    p.clock.advance(DAY);
+    assertEquals(okSummary(await p.run()).processed, 0);
+    assertEquals(p.net.requests.length, 4);
+    assertEquals(p.net.charges.length, 0);
+  });
+});
+
+// ─── Webhooks ────────────────────────────────────────────────────────────────
+
+Deno.test("pipeline: a duplicate webhook delivery does not add a row", async () => {
+  await withPipeline([], async (p) => {
+    const event = paymentFailed("evt_dup", "in_dup");
+    assertEquals((await p.deliver(event)).body.accepted, true);
+    assertEquals(await p.deliver(event), { status: 202, body: { accepted: false, reason: "duplicate" } });
+    // Another event for the same invoice is a duplicate too: the invoice has its row.
+    assertEquals(
+      await p.deliver(paymentFailed("evt_dup_2", "in_dup")),
+      { status: 202, body: { accepted: false, reason: "duplicate" } },
+    );
+    assertEquals((await p.db.rows()).length, 1);
+  });
+});
+
+Deno.test("pipeline: a decline webhook that arrives before the worker records its attempt opens no second row", async () => {
+  await withPipeline(["decline", "approve"], async (p) => {
+    await ingest(p);
+
+    // The processor's webhook for the worker's own attempt lands while the
+    // worker is still waiting on the processor.
+    let early: Awaited<ReturnType<Pipeline["deliver"]>> | undefined;
+    p.net.duringNextCharge = async () => {
+      early = await p.deliver(paymentFailed("evt_attempt_1", "in_1"));
+    };
+    assertEquals(okSummary(await p.run()).rescheduled, 1);
+    assertEquals(early, { status: 202, body: { accepted: false, reason: "duplicate" } });
+    assertEquals([(await p.row()).status, (await p.row()).retry_count], ["pending", 1]);
+
+    // A late redelivery after the attempt was recorded changes nothing either.
+    assertEquals((await p.deliver(paymentFailed("evt_attempt_1", "in_1"))).body.reason, "duplicate");
+
+    p.clock.advance(DAY);
+    assertEquals(okSummary(await p.run()).recovered, 1);
+    // Nor after the invoice was recovered.
+    assertEquals((await p.deliver(paymentFailed("evt_late", "in_1"))).body.reason, "duplicate");
+
+    p.clock.advance(DAY);
+    assertEquals(okSummary(await p.run()).processed, 0);
+    assertEquals(p.net.charges.length, 1);
+  });
+});
+
+// ─── Crashes and overlapping runs ────────────────────────────────────────────
+
+Deno.test("pipeline: a worker killed between the charge and the record does not charge twice", async () => {
+  await withPipeline(["approve"], async (p) => {
+    await ingest(p);
+
+    await assertRejects(() => p.run(crashingOnRecord(p.db.table)), Error, "worker killed");
+    assertEquals(p.net.charges.length, 1);
+    assertEquals((await p.row()).status, "retrying");
+
+    // Inside the stale window the claimed row is left alone.
+    p.clock.advance(CLAIM_STALE_AFTER_MS - MINUTE);
+    assertEquals(okSummary(await p.run()).processed, 0);
+    assertEquals(p.net.requests.length, 1);
+
+    // After it, the next run repeats the attempt with the same key; the
+    // processor answers from its record and nothing is charged again.
+    p.clock.advance(2 * MINUTE);
+    assertEquals(okSummary(await p.run()).recovered, 1);
+    const row = await p.row();
+    assertEquals([row.status, row.retry_count, row.claimed_at], ["recovered", 1, null]);
+    assertEquals(p.net.requests.length, 2);
+    assertEquals(p.net.requests[0].key, p.net.requests[1].key);
+    assertEquals(p.net.charges.length, 1);
+
+    p.clock.advance(DAY);
+    assertEquals(okSummary(await p.run()).processed, 0);
+  });
+});
+
+Deno.test("pipeline: a lost processor answer is settled by repeating the same attempt", async () => {
+  await withPipeline(["approve"], async (p) => {
+    await ingest(p);
+
+    p.net.loseNextAnswer = true;
+    assertEquals(okSummary(await p.run()).errored, 1);
+    assertEquals((await p.row()).status, "retrying");
+
+    p.clock.advance(CLAIM_STALE_AFTER_MS + MINUTE);
+    assertEquals(okSummary(await p.run()).recovered, 1);
+    assertEquals(p.net.charges.length, 1);
+    assertEquals(p.net.requests.length, 2);
+  });
+});
+
+Deno.test("pipeline: a stale claim on a processor that does not honour the key ends in error, not a second charge", async () => {
+  // The second attempt of a Stripe-origin row goes to Braintree.
+  await withPipeline(["decline", "approve"], async (p) => {
+    await ingest(p);
+    await p.run(); // attempt 1, declined
+    p.clock.advance(DAY);
+
+    await assertRejects(() => p.run(crashingOnRecord(p.db.table)), Error, "worker killed");
+    assertEquals(p.net.charges, [{ processor: "braintree", key: p.net.requests[1].key }]);
+
+    p.clock.advance(CLAIM_STALE_AFTER_MS + MINUTE);
+    okSummary(await p.run());
+    const row = await p.row();
+    assertEquals([row.status, row.schedule_reason], ["error", "stale_claim_not_repeatable:braintree"]);
+    assertEquals(p.net.requests.length, 2);
+    assertEquals(p.net.charges.length, 1);
+  });
+});
+
+Deno.test("pipeline: a stale claim older than the processor keeps its keys ends in error", async () => {
+  await withPipeline(["approve"], async (p) => {
+    await ingest(p);
+    await assertRejects(() => p.run(crashingOnRecord(p.db.table)), Error, "worker killed");
+
+    // No worker ran for a day: Stripe and Adyen may have dropped the key.
+    p.clock.advance(DAY);
+    okSummary(await p.run());
+    assertEquals((await p.row()).status, "error");
+    assertEquals(p.net.requests.length, 1);
+  });
+});
+
+Deno.test("pipeline: a run that overlaps another does not touch the row the other has claimed", async () => {
+  await withPipeline(["approve"], async (p) => {
+    await ingest(p);
+
+    let overlapping: Awaited<ReturnType<typeof runRetryBatch>> | undefined;
+    p.net.duringNextCharge = async () => {
+      overlapping = await p.run();
+    };
+    assertEquals(okSummary(await p.run()).recovered, 1);
+    assertEquals(okSummary(overlapping!).processed, 0);
+    assertEquals(p.net.requests.length, 1);
+  });
+});
+
+Deno.test("pipeline: two runs that read the same due row charge it once", async () => {
+  await withPipeline(["approve"], async (p) => {
+    await ingest(p);
+
+    // Both runs read the row before either claims it.
+    let reads = 0;
+    let release: () => void = () => {};
+    const bothRead = new Promise<void>((resolve) => (release = resolve));
+    const slowSelect: QueueTable = {
+      ...p.db.table,
+      async select(columns, filter, limit) {
+        const result = await p.db.table.select(columns, filter, limit);
+        if (filter.eq?.status === "pending" && ++reads === 2) release();
+        if (filter.eq?.status === "pending") await bothRead;
+        return result;
+      },
+    };
+    const [a, b] = await Promise.all([p.run(slowSelect), p.run(slowSelect)]);
+    const summaries = [okSummary(a), okSummary(b)];
+    assertEquals(summaries.map((s) => s.recovered).sort(), [0, 1]);
+    assertEquals(summaries.map((s) => s.skipped).sort(), [0, 1]);
+    assertEquals(p.net.charges.length, 1);
+    assertEquals(p.net.requests.length, 1);
+  });
+});
+
+// ─── Rows the worker finishes without charging ───────────────────────────────
+
+Deno.test("pipeline: a row without a payment token ends in error and is not dispatched again", async () => {
+  await withPipeline([], async (p) => {
+    assertEquals((await p.deliver(paymentFailed("evt_nt", "in_nt"))).body.accepted, true);
+
+    okSummary(await p.run());
+    const row = await p.row();
+    assertEquals([row.status, row.schedule_reason], ["error", "missing_payment_token"]);
+    p.clock.advance(MINUTE);
+    assertEquals(okSummary(await p.run()).processed, 0);
+  });
+});
+
+Deno.test("pipeline: a row the guard blocks ends blocked and is not dispatched again", async () => {
+  await withPipeline([], async (p) => {
+    await ingest(p);
+    await p.db.db.exec("UPDATE syzm_recovery_queue SET decline_category = 'fraud'");
+
+    assertEquals(okSummary(await p.run()).guarded, 1);
+    const row = await p.row();
+    assertEquals([row.status, row.schedule_reason], ["blocked", "blocked:fraud_or_stolen:fraud"]);
+    p.clock.advance(MINUTE);
+    assertEquals(okSummary(await p.run()).processed, 0);
+    assertEquals(p.net.requests.length, 0);
+  });
+});
+
+Deno.test("pipeline: a row due in the Sunday blackout waits, then is charged after it", async () => {
+  await withPipeline(["approve"], async (p) => {
+    await ingest(p);
+    // Sunday 2026-11-29 06:00 UTC is inside the 05:00-08:00 blackout.
+    p.clock.advance(Date.parse("2026-11-29T06:00:00.000Z") - T0);
+
+    assertEquals(okSummary(await p.run()).guarded, 1);
+    assertEquals((await p.row()).status, "pending");
+    assertEquals(p.net.requests.length, 0);
+
+    p.clock.advance(2 * 60 * MINUTE);
+    assertEquals(okSummary(await p.run()).recovered, 1);
+  });
+});

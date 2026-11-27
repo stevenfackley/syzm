@@ -3,6 +3,7 @@
     "@std/http": "https://deno.land/std@0.224.0/http/mod.ts",
     "@supabase/supabase-js": "https://esm.sh/@supabase/supabase-js@2.45.1"
   },
+  "unstable": ["raw-imports"],
   "lint": {
     "exclude": ["_tests/"]
   },
