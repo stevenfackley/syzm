@@ -254,6 +254,7 @@ export async function runRetryBatch(deps: RetryWorkerDeps): Promise<BatchResult>
           amountCents: row.original_amount_cents,
           paymentToken: row.payment_token,
           idempotencyKey: attemptIdempotencyKey(row),
+          queueRowId: row.id,
         },
         rowCorrelation,
       );

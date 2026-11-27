@@ -24,6 +24,7 @@ const attempt = {
   amountCents: 1999,
   paymentToken: "pm_test|cu_test",
   idempotencyKey: "syzm-row-stripe-attempt-1",
+  queueRowId: "row-stripe",
 };
 
 // ─── Fetch mock helper ────────────────────────────────────────────────────────
@@ -68,7 +69,7 @@ Deno.test("Stripe: non-JSON error page returns transient instead of throwing", a
 Deno.test("Adyen: non-JSON error page returns transient instead of throwing", async () => {
   const result = await retryPayment(
     "adyen",
-    { invoiceId: "inv_adyen_html", amountCents: 2500, paymentToken: "shopper123|detail456", idempotencyKey: "k-adyen-html" },
+    { invoiceId: "inv_adyen_html", amountCents: 2500, paymentToken: "shopper123|detail456", idempotencyKey: "k-adyen-html", queueRowId: "r" },
     creds,
     "corr-html-2",
     makeHtmlFetchMock(502),
@@ -80,7 +81,7 @@ Deno.test("Adyen: non-JSON error page returns transient instead of throwing", as
 });
 
 Deno.test("Braintree: non-JSON error page returns transient instead of throwing", async () => {
-  const btHtmlAttempt = { invoiceId: "inv_bt_html", amountCents: 3000, paymentToken: "pmt_abc", idempotencyKey: "k-bt-html" };
+  const btHtmlAttempt = { invoiceId: "inv_bt_html", amountCents: 3000, paymentToken: "pmt_abc", idempotencyKey: "k-bt-html", queueRowId: "r" };
 
   const on502 = await retryPayment("braintree", btHtmlAttempt, creds, "corr-html-3", makeHtmlFetchMock(502));
   assertEquals(on502.ok, false);
@@ -97,8 +98,8 @@ Deno.test("Braintree: non-JSON error page returns transient instead of throwing"
 
 const ATTEMPT_FOR: Record<"stripe" | "adyen" | "braintree", typeof attempt> = {
   stripe: attempt,
-  adyen: { invoiceId: "inv_a", amountCents: 2500, paymentToken: "shopper123|detail456", idempotencyKey: "k-a" },
-  braintree: { invoiceId: "inv_b", amountCents: 3000, paymentToken: "pmt_abc", idempotencyKey: "k-b" },
+  adyen: { invoiceId: "inv_a", amountCents: 2500, paymentToken: "shopper123|detail456", idempotencyKey: "k-a", queueRowId: "r" },
+  braintree: { invoiceId: "inv_b", amountCents: 3000, paymentToken: "pmt_abc", idempotencyKey: "k-b", queueRowId: "r" },
 };
 
 Deno.test("every processor: a 5xx, a 409 or a body that is not JSON is indeterminate", async () => {
@@ -170,6 +171,30 @@ Deno.test("Stripe: sends the attempt's Idempotency-Key header, whatever the corr
   assertEquals(captured.length, 2);
   assertEquals(captured[0].headers.get("Idempotency-Key"), attempt.idempotencyKey);
   assertEquals(captured[1].headers.get("Idempotency-Key"), attempt.idempotencyKey);
+});
+
+Deno.test("Stripe: a PaymentIntent it creates carries the attempt key and the queue row id", async () => {
+  const captured: Request[] = [];
+  const mockFetch = makeFetchMock({ id: "pi_test", status: "succeeded" }, 200, captured);
+
+  await retryPayment("stripe", attempt, creds, "corr-meta", mockFetch);
+
+  assertEquals(captured[0].url, "https://api.stripe.com/v1/payment_intents");
+  const form = new URLSearchParams(await captured[0].text());
+  assertEquals(form.get("metadata[syzm_attempt_key]"), attempt.idempotencyKey);
+  assertEquals(form.get("metadata[syzm_queue_row_id]"), attempt.queueRowId);
+});
+
+Deno.test("Stripe: confirming an existing PaymentIntent sends the key only as the Idempotency-Key", async () => {
+  // The confirm endpoint takes no metadata.
+  const captured: Request[] = [];
+  const mockFetch = makeFetchMock({ id: "pi_existing", status: "succeeded" }, 200, captured);
+
+  await retryPayment("stripe", { ...attempt, paymentToken: "pi_existing|pm_test|cu_test" }, creds, "c", mockFetch);
+
+  assertEquals(captured[0].url, "https://api.stripe.com/v1/payment_intents/pi_existing/confirm");
+  assertEquals(captured[0].headers.get("Idempotency-Key"), attempt.idempotencyKey);
+  assertEquals([...new URLSearchParams(await captured[0].text()).keys()], ["payment_method"]);
 });
 
 Deno.test("Stripe: insufficient_funds decline maps correctly", async () => {
@@ -248,6 +273,7 @@ const adyenAttempt = {
   amountCents: 2500,
   paymentToken: "shopper123|detail456",
   idempotencyKey: "syzm-row-adyen-attempt-1",
+  queueRowId: "row-adyen",
 };
 
 Deno.test("Adyen: Authorised result returns ok=true", async () => {
@@ -314,6 +340,7 @@ const btAttempt = {
   amountCents: 3000,
   paymentToken: "payment_method_token_abc",
   idempotencyKey: "syzm-row-bt-attempt-1",
+  queueRowId: "row-bt",
 };
 
 Deno.test("Braintree: SUBMITTED_FOR_SETTLEMENT returns ok=true", async () => {
@@ -361,6 +388,8 @@ Deno.test("Braintree: sends Idempotency-Key header", async () => {
   await retryPayment("braintree", btAttempt, creds, "corr-bt-key", mockFetch);
 
   assertEquals(captured[0].headers.get("Idempotency-Key"), btAttempt.idempotencyKey);
+  // The transaction's orderId is the attempt key too, so it can be found in Braintree.
+  assertEquals((await captured[0].json()).variables.input.transaction.orderId, btAttempt.idempotencyKey);
 });
 
 Deno.test("Braintree: code 2001 (insufficient funds) maps correctly", async () => {

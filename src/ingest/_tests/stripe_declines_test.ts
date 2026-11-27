@@ -28,6 +28,7 @@ const attempt = {
   amountCents: 1999,
   paymentToken: "pm_test|cu_test",
   idempotencyKey: "syzm-row-attempt-1",
+  queueRowId: "row-decl",
 };
 
 function stripeError(error: Record<string, unknown> | undefined): typeof fetch {

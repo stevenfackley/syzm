@@ -29,6 +29,8 @@ export type RetryAttempt = {
    * characters, Adyen's limit.
    */
   idempotencyKey: string;
+  /** The queue row being retried; recorded at the processor next to the key. */
+  queueRowId: string;
 };
 
 export type RetryResult = {
@@ -182,6 +184,10 @@ async function retryStripe(
   let url: string;
   let body: URLSearchParams;
 
+  // An attempt that ends with an unknown outcome is reconciled by finding it at
+  // Stripe. A PaymentIntent created here carries the attempt key and the row
+  // id in its metadata. The confirm endpoint takes no metadata, so a confirmed
+  // existing PaymentIntent is found by the Idempotency-Key in Stripe's request log.
   if (parts[0].startsWith("pi_")) {
     // Confirm existing PaymentIntent
     const paymentIntentId = parts[0];
@@ -202,6 +208,8 @@ async function retryStripe(
       payment_method: paymentMethodId,
       confirm: "true",
       off_session: "true",
+      "metadata[syzm_attempt_key]": idempotencyKey,
+      "metadata[syzm_queue_row_id]": attempt.queueRowId,
     });
   }
 
