@@ -169,12 +169,13 @@ async function retryStripe(
 ): Promise<AdapterResult> {
   const parts = attempt.paymentToken.split("|");
   if (parts.length < 2) {
+    // Not a Stripe token. Routing sends other processors' rows here too, so
+    // this is not terminal: the row goes on to its own processor.
     return {
       ok: false,
       processor: "stripe",
       declineCategory: "invalid_data",
       rawDeclineCode: "bad_payment_token",
-      retryable: false,
     };
   }
 

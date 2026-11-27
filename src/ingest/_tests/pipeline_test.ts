@@ -680,6 +680,32 @@ Deno.test("pipeline: a Stripe decline that must not be retried ends the row at o
   });
 });
 
+Deno.test("pipeline: a row from another processor still reaches its own processor after Stripe cannot read its token", async () => {
+  // Routing sends a Braintree-origin row to Adyen, then Stripe, then Braintree.
+  // Neither of the first two can read a Braintree token; that must not end the row.
+  await withPipeline(["approve"], async (p) => {
+    const { error } = await p.db.table.insert({
+      invoice_id: "bt_inv_1",
+      processor_event_id: "bt_evt_1",
+      scheduled_at: new Date(T0).toISOString(),
+      status: "pending",
+      processor_origin: "braintree",
+      processor_history: ["braintree"],
+      payment_token: "pmt_braintree_only",
+    });
+    assertEquals(error, null);
+
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      assertEquals(okSummary(await p.run()).rescheduled, 1, `attempt ${attempt}`);
+      p.clock.advance(DAY);
+    }
+    assertEquals(okSummary(await p.run()).recovered, 1);
+    const row = await p.row();
+    assertEquals(row.processor_history, ["braintree", "adyen", "stripe", "braintree"]);
+    assertEquals(p.net.requests.map((r) => r.processor), ["braintree"]);
+  });
+});
+
 // ─── Rows the worker finishes without charging ───────────────────────────────
 
 Deno.test("pipeline: a row without a payment token ends in error and is not dispatched again", async () => {
