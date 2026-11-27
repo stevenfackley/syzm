@@ -367,6 +367,55 @@ const btAttempt = {
   queueRowId: "row-bt",
 };
 
+function btTransaction(status: string): typeof fetch {
+  return makeFetchMock({
+    data: {
+      chargeVaultedPaymentMethod: {
+        transaction: { id: "tx_s", status, processorResponse: { legacyCode: "2001", message: "Insufficient Funds" } },
+      },
+    },
+  });
+}
+
+Deno.test("Braintree: a status still in progress, or one it does not know, is indeterminate", async () => {
+  for (const status of ["AUTHORIZING", "SETTLING", "SETTLEMENT_PENDING", "SETTLEMENT_CONFIRMED", "SOMETHING_NEW", ""]) {
+    const result = await retryPayment("braintree", btAttempt, creds, "c", btTransaction(status));
+    assertEquals([result.ok, result.indeterminate], [false, true], status);
+  }
+});
+
+Deno.test("Braintree: a status after which no money moved is a decline", async () => {
+  for (const status of ["PROCESSOR_DECLINED", "GATEWAY_REJECTED", "FAILED", "SETTLEMENT_DECLINED", "VOIDED", "AUTHORIZATION_EXPIRED"]) {
+    const result = await retryPayment("braintree", btAttempt, creds, "c", btTransaction(status));
+    assertEquals([result.ok, result.indeterminate ?? false, result.declineCategory], [false, false, "insufficient_funds"], status);
+  }
+});
+
+Deno.test("Braintree: a 200 with no transaction, or an INTERNAL GraphQL error, is indeterminate", async () => {
+  const noTx = await retryPayment("braintree", btAttempt, creds, "c", makeFetchMock({ data: {} }));
+  assertEquals([noTx.indeterminate, noTx.rawDeclineCode], [true, "no_transaction_in_response"]);
+
+  for (const errorClass of ["INTERNAL", "SERVICE_AVAILABILITY"]) {
+    const result = await retryPayment(
+      "braintree",
+      btAttempt,
+      creds,
+      "c",
+      makeFetchMock({ errors: [{ message: "x", extensions: { errorClass } }] }),
+    );
+    assertEquals([result.indeterminate, result.rawDeclineCode], [true, `graphql_${errorClass}`]);
+  }
+
+  const validation = await retryPayment(
+    "braintree",
+    btAttempt,
+    creds,
+    "c",
+    makeFetchMock({ errors: [{ message: "bad id", extensions: { errorClass: "VALIDATION" } }] }),
+  );
+  assertEquals([validation.indeterminate ?? false, validation.declineCategory], [false, "invalid_data"]);
+});
+
 Deno.test("Braintree: SUBMITTED_FOR_SETTLEMENT returns ok=true", async () => {
   const captured: Request[] = [];
   const mockFetch = makeFetchMock(

@@ -51,6 +51,7 @@ const creds: ProcessorCredentials = {
  *   stripe_401       Stripe rejects the API key (401 api_key_expired); nothing kept
  *   stripe_404       Stripe cannot find the customer (404 resource_missing); nothing kept
  *   adyen_received   Adyen answers resultCode Received (not decided yet); kept
+ *   braintree_settling  Braintree charges and answers status SETTLING
  */
 type Outcome =
   | "approve"
@@ -65,7 +66,8 @@ type Outcome =
   | "stripe_processing"
   | "stripe_401"
   | "stripe_404"
-  | "adyen_received";
+  | "adyen_received"
+  | "braintree_settling";
 type Answer = { status: number; body: unknown; html?: string };
 
 const SERVER_ERROR: Answer = { status: 500, body: { error: { type: "api_error", message: "internal" } } };
@@ -125,7 +127,10 @@ class ProcessorNetwork {
     if (!answer) {
       const outcome = this.script.shift();
       if (!outcome) throw new Error(`no scripted outcome left for ${processor}`);
-      if (outcome === "approve" || outcome === "charge_then_500" || outcome === "charge_then_500_params_changed") {
+      if (
+        outcome === "approve" || outcome === "charge_then_500" || outcome === "charge_then_500_params_changed" ||
+        outcome === "braintree_settling"
+      ) {
         this.charges.push({ processor, key });
       }
       let kept: Answer | undefined;
@@ -149,6 +154,18 @@ class ProcessorNetwork {
           break;
         case "adyen_received":
           answer = kept = { status: 200, body: { resultCode: "Received", pspReference: `psp_${this.requests.length}` } };
+          break;
+        case "braintree_settling":
+          answer = {
+            status: 200,
+            body: {
+              data: {
+                chargeVaultedPaymentMethod: {
+                  transaction: { id: `bt_${this.requests.length}`, status: "SETTLING", processorResponse: { legacyCode: "1000" } },
+                },
+              },
+            },
+          };
           break;
         case "fail_500":
           answer = SERVER_ERROR;
@@ -648,6 +665,24 @@ Deno.test("pipeline: an Adyen Received is not a decline: the attempt is not move
     assertEquals((await p.row()).schedule_reason, "outcome_unknown:adyen");
     assertEquals(new Set(p.net.requests.map((r) => r.key)).size, 1);
     assertEquals(p.net.requests.map((r) => r.processor), ["adyen", "adyen"]);
+  });
+});
+
+Deno.test("pipeline: a Braintree charge still settling ends error for a person, not a charge under the next key", async () => {
+  // A Stripe-origin row: attempt 1 to Adyen (declined), attempt 2 to Braintree.
+  await withPipeline(["decline", "braintree_settling", "approve"], async (p) => {
+    await ingest(p);
+    await p.run();
+    p.clock.advance(DAY);
+
+    assertEquals(okSummary(await p.run()).errored, 1);
+    assertEquals((await p.row()).status, "retrying");
+    p.clock.advance(16 * MINUTE);
+    okSummary(await p.run());
+    const row = await p.row();
+    assertEquals([row.status, row.retry_count, row.schedule_reason], ["error", 1, "outcome_unknown:braintree"]);
+    assertEquals(p.net.requests.map((r) => r.processor), ["adyen", "braintree"]);
+    assertEquals(p.net.charges.length, 1);
   });
 });
 

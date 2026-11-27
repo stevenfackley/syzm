@@ -439,6 +439,13 @@ async function retryBraintree(
 
   const errors = (json.errors as unknown[] | undefined);
   if (errors && errors.length > 0) {
+    // An INTERNAL or SERVICE_AVAILABILITY error says nothing about whether the
+    // charge ran; the other classes (validation, not found, ...) reject it.
+    const errorClasses = errors.map((e) =>
+      String(((e as Record<string, unknown>)?.extensions as Record<string, unknown> | undefined)?.errorClass ?? "")
+    );
+    const unclear = errorClasses.find((c) => BRAINTREE_UNCLEAR_ERROR_CLASSES.has(c));
+    if (unclear) return unknownOutcome("braintree", `graphql_${unclear}`);
     return {
       ok: false,
       processor: "braintree",
@@ -450,14 +457,7 @@ async function retryBraintree(
   const data = json.data as Record<string, unknown> | undefined;
   const tx = (data?.chargeVaultedPaymentMethod as Record<string, unknown> | undefined)?.transaction as Record<string, unknown> | undefined;
 
-  if (!tx) {
-    return {
-      ok: false,
-      processor: "braintree",
-      declineCategory: "transient",
-      rawDeclineCode: "no_transaction_in_response",
-    };
-  }
+  if (!tx) return unknownOutcome("braintree", "no_transaction_in_response");
 
   const status = String(tx.status ?? "");
   const processorResponse = (tx.processorResponse ?? {}) as Record<string, unknown>;
@@ -473,6 +473,11 @@ async function retryBraintree(
     };
   }
 
+  // Only a status that says no money moved is a decline. Anything else
+  // (AUTHORIZING, SETTLING, SETTLEMENT_PENDING, a status this adapter does not
+  // know) is still in progress or unclear.
+  if (!BRAINTREE_DECLINED_STATUSES.has(status)) return unknownOutcome("braintree", `status_${status || "missing"}`);
+
   return {
     ok: false,
     processor: "braintree",
@@ -480,6 +485,19 @@ async function retryBraintree(
     rawDeclineCode: `${legacyCode}:${message}`,
   };
 }
+
+/** Transaction statuses after which no money moved. */
+const BRAINTREE_DECLINED_STATUSES: ReadonlySet<string> = new Set([
+  "PROCESSOR_DECLINED",
+  "GATEWAY_REJECTED",
+  "FAILED",
+  "SETTLEMENT_DECLINED",
+  "VOIDED",
+  "AUTHORIZATION_EXPIRED",
+]);
+
+/** GraphQL error classes that do not say whether the request ran. */
+const BRAINTREE_UNCLEAR_ERROR_CLASSES: ReadonlySet<string> = new Set(["INTERNAL", "SERVICE_AVAILABILITY"]);
 
 function mapBraintreeResponseCode(legacyCode: string, message: string): DeclineCategory {
   // Braintree processor response codes: https://developer.paypal.com/braintree/docs/reference/general/processor-responses
