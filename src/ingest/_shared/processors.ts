@@ -45,6 +45,15 @@ export type RetryResult = {
    * category but fraud and lost_stolen (NO_RETRY_CATEGORIES).
    */
   retryable: boolean;
+  /**
+   * The answer does not say whether the charge happened: an HTTP status of 500
+   * or above, a 409 (Stripe's answer while another request with the same
+   * idempotency key is in flight), or a body that is not JSON (a gateway or
+   * proxy page). Stripe treats a 500 as indeterminate. The worker handles it
+   * like a network error: it repeats the same attempt under the same key and
+   * never moves on to a new key while the first outcome is unknown.
+   */
+  indeterminate?: boolean;
 };
 
 /** What an adapter returns; retryPayment fills `retryable` when it is left out. */
@@ -106,6 +115,7 @@ export async function retryPayment(
       decline_category: result.declineCategory,
       raw_decline_code: result.rawDeclineCode,
       retryable: result.retryable,
+      indeterminate: result.indeterminate ?? false,
       correlation_id: correlationId,
     }),
   );
@@ -116,7 +126,7 @@ export async function retryPayment(
 /**
  * Parse a processor response body. Returns null when the body is not a JSON
  * object (e.g. an HTML error page from a gateway or proxy) so the caller can
- * report a transient failure instead of throwing.
+ * report an unknown outcome instead of throwing.
  */
 async function readJsonBody(resp: Response): Promise<Record<string, unknown> | null> {
   try {
@@ -127,12 +137,18 @@ async function readJsonBody(resp: Response): Promise<Record<string, unknown> | n
   }
 }
 
-function nonJsonResult(processor: ProcessorName, resp: Response): AdapterResult {
+/** A status that does not say whether the charge happened (see RetryResult.indeterminate). */
+function isIndeterminateStatus(resp: Response): boolean {
+  return resp.status >= 500 || resp.status === 409;
+}
+
+function unknownOutcome(processor: ProcessorName, resp: Response): AdapterResult {
   return {
     ok: false,
     processor,
     declineCategory: "transient",
     rawDeclineCode: `http_${resp.status}`,
+    indeterminate: true,
   };
 }
 
@@ -200,7 +216,7 @@ async function retryStripe(
   });
 
   const json = await readJsonBody(resp);
-  if (!json) return nonJsonResult("stripe", resp);
+  if (!json || isIndeterminateStatus(resp)) return unknownOutcome("stripe", resp);
 
   if (resp.ok) {
     const status = json.status as string | undefined;
@@ -290,7 +306,7 @@ async function retryAdyen(
   });
 
   const json = await readJsonBody(resp);
-  if (!json) return nonJsonResult("adyen", resp);
+  if (!json || isIndeterminateStatus(resp)) return unknownOutcome("adyen", resp);
   const resultCode = String(json.resultCode ?? "");
   const refusalReason = String(json.refusalReason ?? "");
 
@@ -389,6 +405,9 @@ async function retryBraintree(
     body: JSON.stringify({ query, variables }),
   });
 
+  const json = await readJsonBody(resp);
+  if (!json || isIndeterminateStatus(resp)) return unknownOutcome("braintree", resp);
+
   if (!resp.ok) {
     return {
       ok: false,
@@ -397,9 +416,6 @@ async function retryBraintree(
       rawDeclineCode: `http_${resp.status}`,
     };
   }
-
-  const json = await readJsonBody(resp);
-  if (!json) return nonJsonResult("braintree", resp);
 
   const errors = (json.errors as unknown[] | undefined);
   if (errors && errors.length > 0) {

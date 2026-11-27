@@ -93,6 +93,60 @@ Deno.test("Braintree: non-JSON error page returns transient instead of throwing"
   assertEquals(on200.rawDeclineCode, "http_200");
 });
 
+// ─── Answers that do not say whether the card was charged ────────────────────
+
+const ATTEMPT_FOR: Record<"stripe" | "adyen" | "braintree", typeof attempt> = {
+  stripe: attempt,
+  adyen: { invoiceId: "inv_a", amountCents: 2500, paymentToken: "shopper123|detail456", idempotencyKey: "k-a" },
+  braintree: { invoiceId: "inv_b", amountCents: 3000, paymentToken: "pmt_abc", idempotencyKey: "k-b" },
+};
+
+Deno.test("every processor: a 5xx, a 409 or a body that is not JSON is indeterminate", async () => {
+  for (const processor of ["stripe", "adyen", "braintree"] as const) {
+    for (const status of [500, 502, 503, 409]) {
+      const json = await retryPayment(processor, ATTEMPT_FOR[processor], creds, "c", makeFetchMock({ error: {} }, status));
+      assertEquals([json.ok, json.indeterminate, json.rawDeclineCode], [false, true, `http_${status}`], `${processor} ${status}`);
+    }
+    for (const status of [200, 502]) {
+      const html = await retryPayment(processor, ATTEMPT_FOR[processor], creds, "c", makeHtmlFetchMock(status));
+      assertEquals([html.ok, html.indeterminate], [false, true], `${processor} html ${status}`);
+    }
+  }
+});
+
+Deno.test("every processor: a decline the processor states is not indeterminate", async () => {
+  const stripe = await retryPayment(
+    "stripe",
+    attempt,
+    creds,
+    "c",
+    makeFetchMock({ error: { code: "card_declined", decline_code: "insufficient_funds" } }, 402),
+  );
+  const adyen = await retryPayment(
+    "adyen",
+    ATTEMPT_FOR.adyen,
+    creds,
+    "c",
+    makeFetchMock({ resultCode: "Refused", refusalReason: "Not enough balance" }),
+  );
+  const braintree = await retryPayment(
+    "braintree",
+    ATTEMPT_FOR.braintree,
+    creds,
+    "c",
+    makeFetchMock({
+      data: {
+        chargeVaultedPaymentMethod: {
+          transaction: { id: "t", status: "PROCESSOR_DECLINED", processorResponse: { legacyCode: "2001", message: "x" } },
+        },
+      },
+    }),
+  );
+  for (const result of [stripe, adyen, braintree]) {
+    assertEquals([result.ok, result.indeterminate ?? false, result.declineCategory], [false, false, "insufficient_funds"]);
+  }
+});
+
 // ─── Stripe tests ─────────────────────────────────────────────────────────────
 
 Deno.test("Stripe: approved PaymentIntent returns ok=true", async () => {

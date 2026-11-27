@@ -14,7 +14,7 @@ import { assertEquals, assertRejects } from "https://deno.land/std@0.224.0/asser
 
 import { type ProcessorCredentials, retryPayment } from "../_shared/processors.ts";
 import type { QueueTable } from "../_shared/queue.ts";
-import { CLAIM_STALE_AFTER_MS, runRetryBatch } from "../_shared/retry-worker.ts";
+import { runRetryBatch } from "../_shared/retry-worker.ts";
 import type { ProcessorName } from "../_shared/types.ts";
 import { createWebhookHandler } from "../_shared/webhook-handler.ts";
 import { MIGRATIONS, openPipelineDb, type PipelineDb } from "./_pipeline_db.ts";
@@ -36,11 +36,29 @@ const creds: ProcessorCredentials = {
 
 // ─── Fake processor network ──────────────────────────────────────────────────
 
-/** "decline" is an insufficient-funds decline; { stripeDecline } a Stripe decline with that code. */
-type Outcome = "approve" | "decline" | { stripeDecline: string };
-type Answer = { status: number; body: unknown };
+/**
+ * "decline" is an insufficient-funds decline; { stripeDecline } a Stripe
+ * decline with that code. The rest answer without saying what happened:
+ *   charge_then_500  the card is charged, the answer is a 500; the key's record holds the charge
+ *   fail_500         nothing is charged, the answer is a 500, and nothing is kept under the key
+ *   fail_500_cached  nothing is charged, and the 500 is what the key's record replays
+ *   gateway_html     a 502 page that is not JSON; nothing charged or kept
+ *   conflict_409     a 409 idempotency conflict; nothing charged or kept
+ */
+type Outcome =
+  | "approve"
+  | "decline"
+  | { stripeDecline: string }
+  | "charge_then_500"
+  | "fail_500"
+  | "fail_500_cached"
+  | "gateway_html"
+  | "conflict_409";
+type Answer = { status: number; body: unknown; html?: string };
 
-function render(processor: ProcessorName, outcome: Outcome, n: number): Answer {
+const SERVER_ERROR: Answer = { status: 500, body: { error: { type: "api_error", message: "internal" } } };
+
+function render(processor: ProcessorName, outcome: "approve" | "decline" | { stripeDecline: string }, n: number): Answer {
   if (typeof outcome === "object" && processor !== "stripe") throw new Error(`${processor} got a Stripe decline`);
   switch (processor) {
     case "stripe":
@@ -90,13 +108,34 @@ class ProcessorNetwork {
     const key = new Headers(init?.headers).get("Idempotency-Key") ?? "";
     this.requests.push({ processor, key });
 
-    let answer = processor === "braintree" ? undefined : this.remembered.get(`${processor} ${key}`);
+    const memo = `${processor} ${key}`;
+    let answer = processor === "braintree" ? undefined : this.remembered.get(memo);
     if (!answer) {
       const outcome = this.script.shift();
       if (!outcome) throw new Error(`no scripted outcome left for ${processor}`);
-      if (outcome === "approve") this.charges.push({ processor, key });
-      answer = render(processor, outcome, this.requests.length);
-      if (processor !== "braintree") this.remembered.set(`${processor} ${key}`, answer);
+      if (outcome === "approve" || outcome === "charge_then_500") this.charges.push({ processor, key });
+      let kept: Answer | undefined;
+      switch (outcome) {
+        case "charge_then_500":
+          answer = SERVER_ERROR;
+          kept = render(processor, "approve", this.requests.length);
+          break;
+        case "fail_500":
+          answer = SERVER_ERROR;
+          break;
+        case "fail_500_cached":
+          answer = kept = SERVER_ERROR;
+          break;
+        case "gateway_html":
+          answer = { status: 502, body: null, html: "<html><body>502 Bad Gateway</body></html>" };
+          break;
+        case "conflict_409":
+          answer = { status: 409, body: { error: { type: "idempotency_error", message: "in progress" } } };
+          break;
+        default:
+          answer = kept = render(processor, outcome, this.requests.length);
+      }
+      if (kept && processor !== "braintree") this.remembered.set(memo, kept);
     }
 
     const hook = this.duringNextCharge;
@@ -105,6 +144,9 @@ class ProcessorNetwork {
     if (this.loseNextAnswer) {
       this.loseNextAnswer = false;
       throw new TypeError("connection reset by peer");
+    }
+    if (answer.html !== undefined) {
+      return new Response(answer.html, { status: answer.status, headers: { "content-type": "text/html" } });
     }
     return new Response(JSON.stringify(answer.body), {
       status: answer.status,
@@ -146,6 +188,8 @@ type Pipeline = {
   deliver(event: unknown): Promise<{ status: number; body: Record<string, unknown> }>;
   run(table?: QueueTable): ReturnType<typeof runRetryBatch>;
   giveToken(): Promise<void>;
+  /** Make the next attempt go to Stripe (a Stripe-origin row's attempts 1 and 2 go elsewhere). */
+  routeToStripe(): Promise<void>;
   row(): Promise<Record<string, unknown>>;
 };
 
@@ -199,6 +243,9 @@ async function withPipeline(script: Outcome[], fn: (p: Pipeline) => Promise<void
       }),
     async giveToken() {
       await db.db.exec("UPDATE syzm_recovery_queue SET payment_token = 'pm_1|cus_1' WHERE payment_token IS NULL");
+    },
+    async routeToStripe() {
+      await db.db.exec(`UPDATE syzm_recovery_queue SET processor_history = '["stripe","adyen","braintree"]'::jsonb`);
     },
     async row() {
       const rows = await db.rows();
@@ -402,7 +449,7 @@ Deno.test("pipeline: a worker killed between the charge and the record does not 
     assertEquals((await p.row()).status, "retrying");
 
     // Inside the stale window the claimed row is left alone.
-    p.clock.advance(CLAIM_STALE_AFTER_MS - MINUTE);
+    p.clock.advance(14 * MINUTE);
     assertEquals(okSummary(await p.run()).processed, 0);
     assertEquals(p.net.requests.length, 1);
 
@@ -429,10 +476,103 @@ Deno.test("pipeline: a lost processor answer is settled by repeating the same at
     assertEquals(okSummary(await p.run()).errored, 1);
     assertEquals((await p.row()).status, "retrying");
 
-    p.clock.advance(CLAIM_STALE_AFTER_MS + MINUTE);
+    p.clock.advance(16 * MINUTE);
     assertEquals(okSummary(await p.run()).recovered, 1);
     assertEquals(p.net.charges.length, 1);
     assertEquals(p.net.requests.length, 2);
+  });
+});
+
+// ─── Answers that do not say whether the card was charged ────────────────────
+
+Deno.test("pipeline: a Stripe 500 after the card was charged is settled under the same key, not charged again", async () => {
+  await withPipeline(["charge_then_500"], async (p) => {
+    await ingest(p);
+    await p.routeToStripe();
+
+    assertEquals(okSummary(await p.run()).errored, 1);
+    const claimed = await p.row();
+    assertEquals([claimed.status, claimed.retry_count], ["retrying", 0]);
+    assertEquals(p.net.charges.length, 1);
+
+    // Recording a decline here would send attempt 2 under a new key.
+    p.clock.advance(16 * MINUTE);
+    assertEquals(okSummary(await p.run()).recovered, 1);
+    const row = await p.row();
+    assertEquals([row.status, row.retry_count], ["recovered", 1]);
+    assertEquals(p.net.requests.map((r) => r.key), [p.net.requests[0].key, p.net.requests[0].key]);
+    assertEquals(p.net.charges.length, 1);
+  });
+});
+
+Deno.test("pipeline: a Stripe 500 with nothing charged is repeated under the same key and charges once", async () => {
+  await withPipeline(["fail_500", "approve"], async (p) => {
+    await ingest(p);
+    await p.routeToStripe();
+
+    okSummary(await p.run());
+    assertEquals([(await p.row()).status, p.net.charges.length], ["retrying", 0]);
+
+    p.clock.advance(16 * MINUTE);
+    assertEquals(okSummary(await p.run()).recovered, 1);
+    assertEquals(p.net.charges.length, 1);
+    assertEquals(new Set(p.net.requests.map((r) => r.key)).size, 1);
+  });
+});
+
+Deno.test("pipeline: a 500 that never clears ends error, outcome unknown, without a second key", async () => {
+  await withPipeline(["fail_500_cached"], async (p) => {
+    await ingest(p);
+    await p.routeToStripe();
+
+    okSummary(await p.run());
+    // Every 15 minutes the same attempt is repeated; Stripe replays the 500.
+    for (let i = 0; i < 4; i++) {
+      p.clock.advance(16 * MINUTE);
+      assertEquals(okSummary(await p.run()).errored, 1);
+      assertEquals((await p.row()).status, "retrying");
+    }
+    p.clock.advance(23 * 60 * MINUTE);
+    okSummary(await p.run());
+    const row = await p.row();
+    assertEquals([row.status, row.retry_count, row.schedule_reason], ["error", 0, "outcome_unknown:stripe"]);
+    assertEquals(new Set(p.net.requests.map((r) => r.key)).size, 1);
+    assertEquals(p.net.charges.length, 0);
+
+    p.clock.advance(DAY);
+    assertEquals(okSummary(await p.run()).processed, 0);
+  });
+});
+
+Deno.test("pipeline: a gateway page that is not JSON and a 409 take the same path as a 500", async () => {
+  for (const unclear of ["gateway_html", "conflict_409"] as const) {
+    await withPipeline([unclear, "approve"], async (p) => {
+      await ingest(p);
+      await p.routeToStripe();
+
+      assertEquals(okSummary(await p.run()).errored, 1, unclear);
+      assertEquals((await p.row()).status, "retrying", unclear);
+
+      p.clock.advance(16 * MINUTE);
+      assertEquals(okSummary(await p.run()).recovered, 1, unclear);
+      assertEquals(new Set(p.net.requests.map((r) => r.key)).size, 1, unclear);
+      assertEquals(p.net.charges.length, 1, unclear);
+    });
+  }
+});
+
+Deno.test("pipeline: a real Stripe decline is still recorded and retried under the next key", async () => {
+  await withPipeline(["decline", "approve"], async (p) => {
+    await ingest(p);
+    await p.routeToStripe();
+
+    assertEquals(okSummary(await p.run()).rescheduled, 1);
+    const row = await p.row();
+    assertEquals([row.status, row.retry_count, row.last_decline_code], ["pending", 1, "insufficient_funds"]);
+
+    p.clock.advance(DAY);
+    assertEquals(okSummary(await p.run()).recovered, 1);
+    assertEquals(new Set(p.net.requests.map((r) => r.key)).size, 2);
   });
 });
 
@@ -446,10 +586,10 @@ Deno.test("pipeline: a stale claim on a processor that does not honour the key e
     await assertRejects(() => p.run(crashingOnRecord(p.db.table)), Error, "worker killed");
     assertEquals(p.net.charges, [{ processor: "braintree", key: p.net.requests[1].key }]);
 
-    p.clock.advance(CLAIM_STALE_AFTER_MS + MINUTE);
+    p.clock.advance(16 * MINUTE);
     okSummary(await p.run());
     const row = await p.row();
-    assertEquals([row.status, row.schedule_reason], ["error", "stale_claim_not_repeatable:braintree"]);
+    assertEquals([row.status, row.schedule_reason], ["error", "outcome_unknown:braintree"]);
     assertEquals(p.net.requests.length, 2);
     assertEquals(p.net.charges.length, 1);
   });

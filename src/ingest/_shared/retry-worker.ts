@@ -73,7 +73,9 @@ export const CLAIM_STALE_AFTER_MS = 15 * 60 * 1000;
  * takes an apiRequestKey input field instead). A stale claim is repeated only
  * inside this window, counted from the attempt's first claim; otherwise the
  * first request may have charged and a repeat could charge again, so the row
- * ends in 'error' for reconciliation.
+ * ends in 'error' (schedule_reason outcome_unknown:<processor>) for
+ * reconciliation. A claim is left stale by a run that died, a lost answer, or
+ * an indeterminate answer (RetryResult.indeterminate).
  */
 export const IDEMPOTENCY_KEY_LIFETIME_MS: Readonly<Partial<Record<ProcessorName, number>>> = {
   stripe: 23 * 60 * 60 * 1000,
@@ -197,12 +199,16 @@ export async function runRetryBatch(deps: RetryWorkerDeps): Promise<BatchResult>
       const attemptAgeMs = runStart.getTime() - Date.parse(row.attempt_started_at ?? "");
       const keyLifetimeMs = IDEMPOTENCY_KEY_LIFETIME_MS[nextProcessor];
       if (keyLifetimeMs === undefined || !(attemptAgeMs < keyLifetimeMs)) {
+        // The last attempt's outcome is still unknown (the run died, the answer
+        // was lost, or it was indeterminate) and repeating it is no longer
+        // safe: a person has to look the attempt key up at the processor.
         rowLog("error", "stale_claim_not_repeatable", {
           invoice_id: row.invoice_id,
           processor: nextProcessor,
+          attempt_key: attemptIdempotencyKey(row),
           attempt_started_at: row.attempt_started_at,
         });
-        await finish({ status: "error", schedule_reason: `stale_claim_not_repeatable:${nextProcessor}` });
+        await finish({ status: "error", schedule_reason: `outcome_unknown:${nextProcessor}` });
         continue;
       }
       rowLog("warn", "stale_claim_taken_over", {
@@ -238,7 +244,8 @@ export async function runRetryBatch(deps: RetryWorkerDeps): Promise<BatchResult>
     const claimed: RowFilter = { eq: { id: row.id, status: "retrying", claimed_at: claimedAt } };
 
     // ── Charge ──────────────────────────────────────────────────────────────
-    let result: RetryResult;
+    let result: RetryResult | undefined;
+    let unknownOutcome: string | undefined;
     try {
       result = await deps.charge(
         nextProcessor,
@@ -250,15 +257,22 @@ export async function runRetryBatch(deps: RetryWorkerDeps): Promise<BatchResult>
         },
         rowCorrelation,
       );
+      if (result.indeterminate) unknownOutcome = `indeterminate answer ${result.rawDeclineCode ?? ""}`.trim();
     } catch (err) {
-      // A network error has no known outcome: the charge may have gone
-      // through. The row stays claimed; once the claim is stale a later run
-      // repeats the attempt with the same key.
+      unknownOutcome = err instanceof Error ? err.message : String(err);
+    }
+    if (!result || unknownOutcome !== undefined) {
+      // A network error or an indeterminate answer (5xx, 409, not JSON) does
+      // not say whether the charge went through. Moving on to the next attempt
+      // would send a new key and could charge twice, so the row stays claimed;
+      // once the claim is stale a later run repeats this attempt with the same
+      // key, until the processor may have forgotten it (then the row ends error).
       summary.errored += 1;
       rowLog("error", "retry_attempt_error", {
         invoice_id: row.invoice_id,
         processor: nextProcessor,
-        message: err instanceof Error ? err.message : String(err),
+        outcome: "unknown",
+        message: unknownOutcome,
       });
       continue;
     }
