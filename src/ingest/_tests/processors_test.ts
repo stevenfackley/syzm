@@ -115,6 +115,17 @@ Deno.test("every processor: a 5xx, a 409 or a body that is not JSON is indetermi
   }
 });
 
+Deno.test("Stripe: an idempotency_error is indeterminate, not a decline", async () => {
+  const result = await retryPayment(
+    "stripe",
+    attempt,
+    creds,
+    "c",
+    makeFetchMock({ error: { type: "idempotency_error", message: "Keys for idempotent requests can only be used with the same parameters" } }, 400),
+  );
+  assertEquals([result.ok, result.indeterminate, result.rawDeclineCode], [false, true, "idempotency_error"]);
+});
+
 Deno.test("every processor: a decline the processor states is not indeterminate", async () => {
   const stripe = await retryPayment(
     "stripe",
@@ -246,15 +257,15 @@ Deno.test("Stripe: expired_card maps correctly", async () => {
   assertEquals(result.declineCategory, "expired_card");
 });
 
-Deno.test("Stripe: processing PaymentIntent is not reported as a decline", async () => {
-  // The charge was accepted and is settling; a decline here would reschedule it
-  // onto another attempt while the first charge can still succeed.
+Deno.test("Stripe: processing PaymentIntent is neither a decline nor a recovery", async () => {
+  // The charge is settling and can still succeed or fail. A decline would
+  // reschedule it onto another attempt; a recovery would be recorded before the
+  // money is there. It is indeterminate: the same attempt is asked again later.
   const mockFetch = makeFetchMock({ id: "pi_processing", status: "processing" }, 200);
 
   const result = await retryPayment("stripe", attempt, creds, "corr-processing", mockFetch);
 
-  assertEquals(result.ok, true);
-  assertEquals(result.processorReference, "pi_processing");
+  assertEquals([result.ok, result.indeterminate, result.rawDeclineCode], [false, true, "processing"]);
 });
 
 Deno.test("Stripe: requires_action maps to authentication_required", async () => {

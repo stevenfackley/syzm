@@ -144,12 +144,13 @@ function isIndeterminateStatus(resp: Response): boolean {
   return resp.status >= 500 || resp.status === 409;
 }
 
-function unknownOutcome(processor: ProcessorName, resp: Response): AdapterResult {
+/** An answer that does not say whether the charge happened (RetryResult.indeterminate). */
+function unknownOutcome(processor: ProcessorName, rawDeclineCode: string): AdapterResult {
   return {
     ok: false,
     processor,
     declineCategory: "transient",
-    rawDeclineCode: `http_${resp.status}`,
+    rawDeclineCode,
     indeterminate: true,
   };
 }
@@ -225,13 +226,11 @@ async function retryStripe(
   });
 
   const json = await readJsonBody(resp);
-  if (!json || isIndeterminateStatus(resp)) return unknownOutcome("stripe", resp);
+  if (!json || isIndeterminateStatus(resp)) return unknownOutcome("stripe", `http_${resp.status}`);
 
   if (resp.ok) {
     const status = json.status as string | undefined;
-    // "processing": Stripe accepted the charge and is still settling it, so it
-    // must not be retried. If it fails later Stripe sends a new payment_failed event.
-    if (status === "succeeded" || status === "processing") {
+    if (status === "succeeded") {
       return {
         ok: true,
         processor: "stripe",
@@ -239,6 +238,9 @@ async function retryStripe(
         processorReference: json.id as string,
       };
     }
+    // "processing": Stripe has not finished; the payment can still fail. Not a
+    // recovery and not a decline: the same attempt is asked again later.
+    if (status === "processing") return unknownOutcome("stripe", "processing");
     // requires_action / requires_payment_method → needs the customer to
     // authenticate or pay another way; Stripe lists authentication_required
     // as a hard decline (declines.ts).
@@ -255,6 +257,9 @@ async function retryStripe(
 
   // Error path
   const err = (json.error ?? {}) as Record<string, unknown>;
+  // An idempotency_error (for example the same key sent with different
+  // parameters) says nothing about the first request under that key.
+  if (err.type === "idempotency_error") return unknownOutcome("stripe", "idempotency_error");
   const rawCode = stripeErrorCode(err) ?? "unknown";
   const decline = classifyStripeDecline(rawCode);
   return {
@@ -315,7 +320,7 @@ async function retryAdyen(
   });
 
   const json = await readJsonBody(resp);
-  if (!json || isIndeterminateStatus(resp)) return unknownOutcome("adyen", resp);
+  if (!json || isIndeterminateStatus(resp)) return unknownOutcome("adyen", `http_${resp.status}`);
   const resultCode = String(json.resultCode ?? "");
   const refusalReason = String(json.refusalReason ?? "");
 
@@ -415,7 +420,7 @@ async function retryBraintree(
   });
 
   const json = await readJsonBody(resp);
-  if (!json || isIndeterminateStatus(resp)) return unknownOutcome("braintree", resp);
+  if (!json || isIndeterminateStatus(resp)) return unknownOutcome("braintree", `http_${resp.status}`);
 
   if (!resp.ok) {
     return {

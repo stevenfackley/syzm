@@ -44,6 +44,12 @@ const creds: ProcessorCredentials = {
  *   fail_500_cached  nothing is charged, and the 500 is what the key's record replays
  *   gateway_html     a 502 page that is not JSON; nothing charged or kept
  *   conflict_409     a 409 idempotency conflict; nothing charged or kept
+ *   charge_then_500_params_changed
+ *                    the card is charged, the answer is a 500, and a repeat under the
+ *                    key gets Stripe's 400 idempotency_error (its parameters differ)
+ *   stripe_processing  Stripe answers a PaymentIntent in status processing; kept
+ *   stripe_401       Stripe rejects the API key (401 api_key_expired); nothing kept
+ *   stripe_404       Stripe cannot find the customer (404 resource_missing); nothing kept
  */
 type Outcome =
   | "approve"
@@ -53,7 +59,11 @@ type Outcome =
   | "fail_500"
   | "fail_500_cached"
   | "gateway_html"
-  | "conflict_409";
+  | "conflict_409"
+  | "charge_then_500_params_changed"
+  | "stripe_processing"
+  | "stripe_401"
+  | "stripe_404";
 type Answer = { status: number; body: unknown; html?: string };
 
 const SERVER_ERROR: Answer = { status: 500, body: { error: { type: "api_error", message: "internal" } } };
@@ -113,12 +123,27 @@ class ProcessorNetwork {
     if (!answer) {
       const outcome = this.script.shift();
       if (!outcome) throw new Error(`no scripted outcome left for ${processor}`);
-      if (outcome === "approve" || outcome === "charge_then_500") this.charges.push({ processor, key });
+      if (outcome === "approve" || outcome === "charge_then_500" || outcome === "charge_then_500_params_changed") {
+        this.charges.push({ processor, key });
+      }
       let kept: Answer | undefined;
       switch (outcome) {
         case "charge_then_500":
           answer = SERVER_ERROR;
           kept = render(processor, "approve", this.requests.length);
+          break;
+        case "charge_then_500_params_changed":
+          answer = SERVER_ERROR;
+          kept = { status: 400, body: { error: { type: "idempotency_error", message: "parameters differ" } } };
+          break;
+        case "stripe_processing":
+          answer = kept = { status: 200, body: { id: `pi_${this.requests.length}`, status: "processing" } };
+          break;
+        case "stripe_401":
+          answer = { status: 401, body: { error: { type: "invalid_request_error", code: "api_key_expired" } } };
+          break;
+        case "stripe_404":
+          answer = { status: 404, body: { error: { type: "invalid_request_error", code: "resource_missing" } } };
           break;
         case "fail_500":
           answer = SERVER_ERROR;
@@ -559,6 +584,48 @@ Deno.test("pipeline: a gateway page that is not JSON and a 409 take the same pat
       assertEquals(p.net.charges.length, 1, unclear);
     });
   }
+});
+
+Deno.test("pipeline: a Stripe idempotency_error on a repeat does not move the row to a new key", async () => {
+  // Attempt 1 is charged and answered 500. Before the repeat, its parameters
+  // change (a deploy, a rewritten token); Stripe answers the repeat with an
+  // idempotency_error, which says nothing about the first request.
+  await withPipeline(["charge_then_500_params_changed", "approve"], async (p) => {
+    await ingest(p);
+    await p.routeToStripe();
+
+    okSummary(await p.run());
+    p.clock.advance(16 * MINUTE);
+    assertEquals(okSummary(await p.run()).errored, 1);
+    assertEquals([(await p.row()).status, (await p.row()).retry_count], ["retrying", 0]);
+
+    p.clock.advance(23 * 60 * MINUTE);
+    okSummary(await p.run());
+    assertEquals((await p.row()).schedule_reason, "outcome_unknown:stripe");
+    p.clock.advance(DAY);
+    assertEquals(okSummary(await p.run()).processed, 0);
+    assertEquals(new Set(p.net.requests.map((r) => r.key)).size, 1);
+    assertEquals(p.net.charges.length, 1);
+  });
+});
+
+Deno.test("pipeline: a Stripe PaymentIntent still processing is not recorded as recovered", async () => {
+  await withPipeline(["stripe_processing"], async (p) => {
+    await ingest(p);
+    await p.routeToStripe();
+
+    assertEquals(okSummary(await p.run()).recovered, 0);
+    assertEquals((await p.row()).status, "retrying");
+    p.clock.advance(16 * MINUTE);
+    assertEquals(okSummary(await p.run()).recovered, 0);
+    assertEquals((await p.row()).status, "retrying");
+
+    p.clock.advance(23 * 60 * MINUTE);
+    okSummary(await p.run());
+    const row = await p.row();
+    assertEquals([row.status, row.schedule_reason, row.recovered_at], ["error", "outcome_unknown:stripe", null]);
+    assertEquals(new Set(p.net.requests.map((r) => r.key)).size, 1);
+  });
 });
 
 Deno.test("pipeline: a real Stripe decline is still recorded and retried under the next key", async () => {
