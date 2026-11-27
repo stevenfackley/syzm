@@ -311,6 +311,19 @@ Deno.test("Adyen: sends the attempt's Idempotency-Key header and uses it as the 
   assertEquals((await captured[0].json()).reference, adyenAttempt.idempotencyKey);
 });
 
+Deno.test("Adyen: Received and Pending are indeterminate, not declines", async () => {
+  for (const resultCode of ["Received", "Pending"]) {
+    const result = await retryPayment(
+      "adyen",
+      adyenAttempt,
+      creds,
+      "c",
+      makeFetchMock({ resultCode, pspReference: "psp_pending" }),
+    );
+    assertEquals([result.ok, result.indeterminate, result.rawDeclineCode], [false, true, resultCode]);
+  }
+});
+
 Deno.test("Adyen: Refused with insufficient funds maps correctly", async () => {
   const mockFetch = makeFetchMock(
     { resultCode: "Refused", refusalReason: "Not enough balance" },

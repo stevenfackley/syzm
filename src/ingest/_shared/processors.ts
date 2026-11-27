@@ -333,6 +333,12 @@ async function retryAdyen(
     };
   }
 
+  // Received and Pending are intermediate: Adyen has not decided, and the
+  // payment can still be authorised.
+  if (resultCode === "Received" || resultCode === "Pending") {
+    return unknownOutcome("adyen", resultCode);
+  }
+
   return {
     ok: false,
     processor: "adyen",

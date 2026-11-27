@@ -50,6 +50,7 @@ const creds: ProcessorCredentials = {
  *   stripe_processing  Stripe answers a PaymentIntent in status processing; kept
  *   stripe_401       Stripe rejects the API key (401 api_key_expired); nothing kept
  *   stripe_404       Stripe cannot find the customer (404 resource_missing); nothing kept
+ *   adyen_received   Adyen answers resultCode Received (not decided yet); kept
  */
 type Outcome =
   | "approve"
@@ -63,7 +64,8 @@ type Outcome =
   | "charge_then_500_params_changed"
   | "stripe_processing"
   | "stripe_401"
-  | "stripe_404";
+  | "stripe_404"
+  | "adyen_received";
 type Answer = { status: number; body: unknown; html?: string };
 
 const SERVER_ERROR: Answer = { status: 500, body: { error: { type: "api_error", message: "internal" } } };
@@ -144,6 +146,9 @@ class ProcessorNetwork {
           break;
         case "stripe_404":
           answer = { status: 404, body: { error: { type: "invalid_request_error", code: "resource_missing" } } };
+          break;
+        case "adyen_received":
+          answer = kept = { status: 200, body: { resultCode: "Received", pspReference: `psp_${this.requests.length}` } };
           break;
         case "fail_500":
           answer = SERVER_ERROR;
@@ -625,6 +630,24 @@ Deno.test("pipeline: a Stripe PaymentIntent still processing is not recorded as 
     const row = await p.row();
     assertEquals([row.status, row.schedule_reason, row.recovered_at], ["error", "outcome_unknown:stripe", null]);
     assertEquals(new Set(p.net.requests.map((r) => r.key)).size, 1);
+  });
+});
+
+Deno.test("pipeline: an Adyen Received is not a decline: the attempt is not moved to a new key", async () => {
+  // A Stripe-origin row's first attempt goes to Adyen.
+  await withPipeline(["adyen_received", "approve"], async (p) => {
+    await ingest(p);
+
+    assertEquals(okSummary(await p.run()).errored, 1);
+    p.clock.advance(16 * MINUTE);
+    assertEquals(okSummary(await p.run()).errored, 1); // Adyen answers the key with Received again
+    assertEquals([(await p.row()).status, (await p.row()).retry_count], ["retrying", 0]);
+
+    p.clock.advance(23 * 60 * MINUTE);
+    okSummary(await p.run());
+    assertEquals((await p.row()).schedule_reason, "outcome_unknown:adyen");
+    assertEquals(new Set(p.net.requests.map((r) => r.key)).size, 1);
+    assertEquals(p.net.requests.map((r) => r.processor), ["adyen", "adyen"]);
   });
 });
 
