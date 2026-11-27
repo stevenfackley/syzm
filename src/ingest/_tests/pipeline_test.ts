@@ -622,6 +622,67 @@ Deno.test("pipeline: a run that overlaps another does not touch the row the othe
   });
 });
 
+Deno.test("pipeline: an attempt still out after 10 minutes is not taken over", async () => {
+  await withPipeline(["approve"], async (p) => {
+    await ingest(p);
+
+    let meanwhile: Awaited<ReturnType<typeof runRetryBatch>> | undefined;
+    p.net.duringNextCharge = async () => {
+      // The processor takes 10 minutes to answer; another run starts meanwhile.
+      p.clock.advance(10 * MINUTE);
+      meanwhile = await p.run();
+    };
+    assertEquals(okSummary(await p.run()).recovered, 1);
+    assertEquals(okSummary(meanwhile!).processed, 0);
+    assertEquals(p.net.requests.length, 1);
+  });
+});
+
+Deno.test("pipeline: two runs that take over the same stale row repeat the attempt once", async () => {
+  await withPipeline(["approve"], async (p) => {
+    await ingest(p);
+    await assertRejects(() => p.run(crashingOnRecord(p.db.table)), Error, "worker killed");
+    p.clock.advance(16 * MINUTE);
+
+    // Both runs read the stale row before either claims it.
+    let reads = 0;
+    let release: () => void = () => {};
+    const bothRead = new Promise<void>((resolve) => (release = resolve));
+    const slowStale: QueueTable = {
+      ...p.db.table,
+      async select(columns, filter, limit) {
+        const result = await p.db.table.select(columns, filter, limit);
+        if (filter.eq?.status === "retrying") {
+          if (++reads === 2) release();
+          await bothRead;
+        }
+        return result;
+      },
+    };
+    const [a, b] = await Promise.all([p.run(slowStale), p.run(slowStale)]);
+    const summaries = [okSummary(a), okSummary(b)];
+    assertEquals(summaries.map((s) => s.recovered).sort(), [0, 1]);
+    assertEquals(summaries.map((s) => s.skipped).sort(), [0, 1]);
+    assertEquals(p.net.requests.length, 2); // the first attempt and one repeat
+    assertEquals(p.net.charges.length, 1);
+  });
+});
+
+Deno.test("pipeline: a run whose claim was taken over does not write its outcome", async () => {
+  await withPipeline(["decline"], async (p) => {
+    await ingest(p);
+
+    // While the charge is out, another run takes the claim (a takeover moves claimed_at).
+    p.net.duringNextCharge = async () => {
+      await p.db.db.exec("UPDATE syzm_recovery_queue SET claimed_at = claimed_at + interval '1 second'");
+    };
+    const summary = okSummary(await p.run());
+    assertEquals([summary.rescheduled, summary.write_failed], [1, 1]);
+    const row = await p.row();
+    assertEquals([row.status, row.retry_count, row.last_decline_code], ["retrying", 0, null]);
+  });
+});
+
 Deno.test("pipeline: two runs that read the same due row charge it once", async () => {
   await withPipeline(["approve"], async (p) => {
     await ingest(p);
