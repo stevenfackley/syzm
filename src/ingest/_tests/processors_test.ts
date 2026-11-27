@@ -126,6 +126,44 @@ Deno.test("Stripe: an idempotency_error is indeterminate, not a decline", async 
   assertEquals([result.ok, result.indeterminate, result.rawDeclineCode], [false, true, "idempotency_error"]);
 });
 
+Deno.test("every processor: a 401, 403 or 429 refuses the request before any attempt", async () => {
+  for (const processor of ["stripe", "adyen", "braintree"] as const) {
+    for (const status of [401, 403, 429]) {
+      const result = await retryPayment(
+        processor,
+        ATTEMPT_FOR[processor],
+        creds,
+        "c",
+        makeFetchMock({ error: { type: "invalid_request_error", code: "api_key_expired" } }, status),
+      );
+      assertEquals([result.ok, result.operational, result.indeterminate ?? false], [false, true, false], `${processor} ${status}`);
+    }
+  }
+});
+
+Deno.test("Stripe: an error that is not a card error is not classified by the decline table", async () => {
+  // "expired" in a non-card code must not become expired_card (terminal).
+  for (const code of ["api_key_expired", "token_expired_somehow", "resource_missing"]) {
+    const result = await retryPayment(
+      "stripe",
+      attempt,
+      creds,
+      "c",
+      makeFetchMock({ error: { type: "invalid_request_error", code } }, 400),
+    );
+    assertEquals([result.declineCategory, result.retryable, result.rawDeclineCode], ["unknown", true, code], code);
+  }
+  // The same code from a card error does go through the table.
+  const card = await retryPayment(
+    "stripe",
+    attempt,
+    creds,
+    "c",
+    makeFetchMock({ error: { type: "card_error", code: "expired_card" } }, 402),
+  );
+  assertEquals([card.declineCategory, card.retryable], ["expired_card", false]);
+});
+
 Deno.test("every processor: a decline the processor states is not indeterminate", async () => {
   const stripe = await retryPayment(
     "stripe",

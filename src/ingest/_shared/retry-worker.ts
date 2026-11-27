@@ -65,6 +65,9 @@ export const BATCH_LIMIT = 500;
  */
 export const CLAIM_STALE_AFTER_MS = 15 * 60 * 1000;
 
+/** How long a row waits after the processor refused the request itself (RetryResult.operational). */
+export const OPERATIONAL_RETRY_AFTER_MS = 15 * 60 * 1000;
+
 /**
  * How long each processor answers a repeated idempotency key from its record
  * of the first request. Stripe removes keys once they are at least 24 hours
@@ -108,6 +111,8 @@ export type BatchSummary = {
   write_failed: number;
   /** Claimed by another run between the select and this run's claim. */
   skipped: number;
+  /** Refused by the processor before any attempt; released without spending one. */
+  deferred: number;
 };
 
 export type BatchResult = { ok: true; summary: BatchSummary } | { ok: false; error: "due_fetch_error" };
@@ -148,6 +153,7 @@ export async function runRetryBatch(deps: RetryWorkerDeps): Promise<BatchResult>
     errored: 0,
     write_failed: 0,
     skipped: 0,
+    deferred: 0,
   };
 
   for (const row of rows) {
@@ -194,8 +200,12 @@ export async function runRetryBatch(deps: RetryWorkerDeps): Promise<BatchResult>
 
     const nextProcessor = pickNextProcessor(row.processor_origin, row.processor_history ?? []);
 
+    // A row whose current attempt was sent before and has no known outcome:
+    // a stale claim, or a row released after an operational failure on a
+    // repeat. Its attempt is repeated only while the processor keeps the key.
     const takeover = row.status === "retrying";
-    if (takeover) {
+    const repeat = takeover || row.attempt_started_at !== null;
+    if (repeat) {
       const attemptAgeMs = runStart.getTime() - Date.parse(row.attempt_started_at ?? "");
       const keyLifetimeMs = IDEMPOTENCY_KEY_LIFETIME_MS[nextProcessor];
       if (keyLifetimeMs === undefined || !(attemptAgeMs < keyLifetimeMs)) {
@@ -211,10 +221,11 @@ export async function runRetryBatch(deps: RetryWorkerDeps): Promise<BatchResult>
         await finish({ status: "error", schedule_reason: `outcome_unknown:${nextProcessor}` });
         continue;
       }
-      rowLog("warn", "stale_claim_taken_over", {
+      rowLog("warn", takeover ? "stale_claim_taken_over" : "attempt_repeated", {
         invoice_id: row.invoice_id,
         processor: nextProcessor,
         claimed_at: row.claimed_at,
+        attempt_started_at: row.attempt_started_at,
       });
     }
 
@@ -223,7 +234,7 @@ export async function runRetryBatch(deps: RetryWorkerDeps): Promise<BatchResult>
     const claim = await table.update(
       takeover
         ? { claimed_at: claimedAt }
-        : { status: "retrying", claimed_at: claimedAt, attempt_started_at: claimedAt },
+        : { status: "retrying", claimed_at: claimedAt, attempt_started_at: row.attempt_started_at ?? claimedAt },
       asRead,
     );
     if (claim.error) {
@@ -275,6 +286,28 @@ export async function runRetryBatch(deps: RetryWorkerDeps): Promise<BatchResult>
         outcome: "unknown",
         message: unknownOutcome,
       });
+      continue;
+    }
+
+    if (result.operational) {
+      // The processor refused the request before any attempt (our key, its
+      // permissions, or a rate limit). Release the row without spending an
+      // attempt; the same attempt, under the same key, goes out again later.
+      // On a repeat the attempt's start is kept, so the key window still holds.
+      summary.deferred += 1;
+      rowLog("error", "processor_operational_failure", {
+        invoice_id: row.invoice_id,
+        processor: nextProcessor,
+        code: result.rawDeclineCode,
+        retry_at: new Date(runStart.getTime() + OPERATIONAL_RETRY_AFTER_MS).toISOString(),
+      });
+      const outcome = await writeRow(table, row, {
+        status: "pending",
+        scheduled_at: new Date(runStart.getTime() + OPERATIONAL_RETRY_AFTER_MS).toISOString(),
+        claimed_at: null,
+        attempt_started_at: repeat ? row.attempt_started_at : null,
+      }, claimed, rowLog);
+      if (outcome !== "written") summary.write_failed += 1;
       continue;
     }
 

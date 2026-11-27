@@ -109,6 +109,8 @@ class ProcessorNetwork {
   duringNextCharge?: () => Promise<void>;
   /** The next answer is lost on the way back (the processor did act). */
   loseNextAnswer = false;
+  /** The next request is answered with this before the processor looks at it (no charge, nothing kept). */
+  refuseNext?: Answer;
 
   constructor(private readonly script: Outcome[]) {}
 
@@ -123,6 +125,11 @@ class ProcessorNetwork {
     this.requests.push({ processor, key });
 
     const memo = `${processor} ${key}`;
+    if (this.refuseNext) {
+      const refusal = this.refuseNext;
+      this.refuseNext = undefined;
+      return new Response(JSON.stringify(refusal.body), { status: refusal.status });
+    }
     let answer = processor === "braintree" ? undefined : this.remembered.get(memo);
     if (!answer) {
       const outcome = this.script.shift();
@@ -683,6 +690,69 @@ Deno.test("pipeline: a Braintree charge still settling ends error for a person, 
     assertEquals([row.status, row.retry_count, row.schedule_reason], ["error", 1, "outcome_unknown:braintree"]);
     assertEquals(p.net.requests.map((r) => r.processor), ["adyen", "braintree"]);
     assertEquals(p.net.charges.length, 1);
+  });
+});
+
+// ─── Answers that refuse the request itself ──────────────────────────────────
+
+Deno.test("pipeline: a Stripe 401 (api_key_expired) does not block, spends no attempt, and keeps the key", async () => {
+  await withPipeline(["stripe_401", "approve"], async (p) => {
+    await ingest(p);
+    await p.routeToStripe();
+
+    assertEquals(okSummary(await p.run()).deferred, 1);
+    const released = await p.row();
+    assertEquals(
+      [released.status, released.retry_count, released.claimed_at, released.attempt_started_at, released.last_decline_code],
+      ["pending", 0, null, null, null],
+    );
+    assertEquals(Date.parse(String(released.scheduled_at)), T0 + 15 * MINUTE);
+
+    p.clock.advance(10 * MINUTE);
+    assertEquals(okSummary(await p.run()).processed, 0);
+
+    p.clock.advance(6 * MINUTE);
+    assertEquals(okSummary(await p.run()).recovered, 1);
+    const row = await p.row();
+    assertEquals([row.status, row.retry_count], ["recovered", 1]);
+    assertEquals(p.net.requests.length, 2);
+    assertEquals(new Set(p.net.requests.map((r) => r.key)).size, 1);
+  });
+});
+
+Deno.test("pipeline: a 401 on a repeat keeps the attempt's start, so the key window still ends it", async () => {
+  await withPipeline(["fail_500"], async (p) => {
+    await ingest(p);
+    await p.routeToStripe();
+
+    okSummary(await p.run()); // attempt 1 answered 500: parked
+    p.clock.advance(16 * MINUTE);
+    p.net.refuseNext = { status: 401, body: { error: { type: "invalid_request_error", code: "api_key_expired" } } };
+    assertEquals(okSummary(await p.run()).deferred, 1);
+    const released = await p.row();
+    assertEquals([released.status, released.retry_count], ["pending", 0]);
+    assertEquals(Date.parse(String(released.attempt_started_at)), T0);
+
+    // The first request's outcome is still unknown; after 23 hours Stripe may
+    // have dropped the key, so the attempt is not sent a third time.
+    p.clock.advance(23 * 60 * MINUTE);
+    okSummary(await p.run());
+    assertEquals((await p.row()).schedule_reason, "outcome_unknown:stripe");
+    assertEquals(p.net.requests.length, 2);
+  });
+});
+
+Deno.test("pipeline: a Stripe 404 that is not a card error spends an attempt and is not read as a decline code", async () => {
+  await withPipeline(["stripe_404"], async (p) => {
+    await ingest(p);
+    await p.routeToStripe();
+
+    assertEquals(okSummary(await p.run()).rescheduled, 1);
+    const row = await p.row();
+    assertEquals(
+      [row.status, row.retry_count, row.decline_category, row.last_decline_code],
+      ["pending", 1, "unknown", "resource_missing"],
+    );
   });
 });
 

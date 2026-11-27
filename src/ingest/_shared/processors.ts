@@ -56,6 +56,13 @@ export type RetryResult = {
    * never moves on to a new key while the first outcome is unknown.
    */
   indeterminate?: boolean;
+  /**
+   * The processor refused the request itself, before looking at the card: a
+   * 401 or 403 (our API key or its permissions) or a 429 (rate limited). No
+   * attempt happened. The worker releases the row without spending an attempt
+   * and tries the same attempt again later.
+   */
+  operational?: boolean;
 };
 
 /** What an adapter returns; retryPayment fills `retryable` when it is left out. */
@@ -142,6 +149,21 @@ async function readJsonBody(resp: Response): Promise<Record<string, unknown> | n
 /** A status that does not say whether the charge happened (see RetryResult.indeterminate). */
 function isIndeterminateStatus(resp: Response): boolean {
   return resp.status >= 500 || resp.status === 409;
+}
+
+/** A status that means the request was refused before any attempt (RetryResult.operational). */
+function isOperationalStatus(resp: Response): boolean {
+  return resp.status === 401 || resp.status === 403 || resp.status === 429;
+}
+
+function operationalFailure(processor: ProcessorName, resp: Response, code?: string): AdapterResult {
+  return {
+    ok: false,
+    processor,
+    declineCategory: "unknown",
+    rawDeclineCode: code ?? `http_${resp.status}`,
+    operational: true,
+  };
 }
 
 /** An answer that does not say whether the charge happened (RetryResult.indeterminate). */
@@ -261,6 +283,14 @@ async function retryStripe(
   // parameters) says nothing about the first request under that key.
   if (err.type === "idempotency_error") return unknownOutcome("stripe", "idempotency_error");
   const rawCode = stripeErrorCode(err) ?? "unknown";
+  if (isOperationalStatus(resp)) return operationalFailure("stripe", resp, rawCode);
+
+  // Only a card error is a decline; the decline table is for those codes.
+  // Other errors (invalid_request_error, api_error) are not classified by the
+  // table or its keywords: api_key_expired is not an expired card.
+  if (err.type !== "card_error" && resp.status !== 402) {
+    return { ok: false, processor: "stripe", declineCategory: "unknown", rawDeclineCode: rawCode };
+  }
   const decline = classifyStripeDecline(rawCode);
   return {
     ok: false,
@@ -321,6 +351,7 @@ async function retryAdyen(
 
   const json = await readJsonBody(resp);
   if (!json || isIndeterminateStatus(resp)) return unknownOutcome("adyen", `http_${resp.status}`);
+  if (isOperationalStatus(resp)) return operationalFailure("adyen", resp);
   const resultCode = String(json.resultCode ?? "");
   const refusalReason = String(json.refusalReason ?? "");
 
@@ -427,6 +458,7 @@ async function retryBraintree(
 
   const json = await readJsonBody(resp);
   if (!json || isIndeterminateStatus(resp)) return unknownOutcome("braintree", `http_${resp.status}`);
+  if (isOperationalStatus(resp)) return operationalFailure("braintree", resp);
 
   if (!resp.ok) {
     return {
