@@ -99,6 +99,8 @@ export type BatchSummary = {
   recovered: number;
   rescheduled: number;
   exhausted: number;
+  /** Declined with a code that must not be retried (declines.ts). */
+  blocked: number;
   guarded: number;
   errored: number;
   write_failed: number;
@@ -139,6 +141,7 @@ export async function runRetryBatch(deps: RetryWorkerDeps): Promise<BatchResult>
     recovered: 0,
     rescheduled: 0,
     exhausted: 0,
+    blocked: 0,
     guarded: 0,
     errored: 0,
     write_failed: 0,
@@ -287,7 +290,30 @@ export async function runRetryBatch(deps: RetryWorkerDeps): Promise<BatchResult>
       continue;
     }
 
-    if (newRetryCount >= VISA_MAX_RETRIES) {
+    const next = afterDecline(result, newRetryCount);
+
+    if (next === "blocked") {
+      summary.blocked += 1;
+      const reason = `blocked:not_retryable:${result.rawDeclineCode ?? result.declineCategory}`;
+      rowLog("info", "retry_declined_not_retryable", {
+        invoice_id: row.invoice_id,
+        retry_count: newRetryCount,
+        decline_category: result.declineCategory,
+        raw_decline_code: result.rawDeclineCode,
+      });
+      await record({
+        status: "blocked",
+        retry_count: newRetryCount,
+        processor_history: history,
+        exhausted_at: nowIso,
+        schedule_reason: reason,
+        decline_category: result.declineCategory,
+        last_decline_code: result.rawDeclineCode ?? null,
+      });
+      continue;
+    }
+
+    if (next === "exhausted") {
       summary.exhausted += 1;
       rowLog("info", "retry_exhausted", {
         invoice_id: row.invoice_id,
@@ -339,6 +365,19 @@ export async function runRetryBatch(deps: RetryWorkerDeps): Promise<BatchResult>
 
   log("info", "batch_complete", { ...summary });
   return { ok: true, summary };
+}
+
+/**
+ * What the worker does with a declined attempt: stop for good when the decline
+ * must not be retried, stop at the Visa cap, otherwise schedule the next try.
+ */
+export function afterDecline(
+  result: Pick<RetryResult, "retryable">,
+  attemptsMade: number,
+): "blocked" | "exhausted" | "rescheduled" {
+  if (!result.retryable) return "blocked";
+  if (attemptsMade >= VISA_MAX_RETRIES) return "exhausted";
+  return "rescheduled";
 }
 
 /** The Brain client as the worker uses it: a failed call falls back to a fixed delay. */

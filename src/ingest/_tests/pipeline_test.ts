@@ -36,15 +36,25 @@ const creds: ProcessorCredentials = {
 
 // ─── Fake processor network ──────────────────────────────────────────────────
 
-type Outcome = "approve" | "decline";
+/** "decline" is an insufficient-funds decline; { stripeDecline } a Stripe decline with that code. */
+type Outcome = "approve" | "decline" | { stripeDecline: string };
 type Answer = { status: number; body: unknown };
 
 function render(processor: ProcessorName, outcome: Outcome, n: number): Answer {
+  if (typeof outcome === "object" && processor !== "stripe") throw new Error(`${processor} got a Stripe decline`);
   switch (processor) {
     case "stripe":
       return outcome === "approve"
         ? { status: 200, body: { id: `pi_${n}`, status: "succeeded" } }
-        : { status: 402, body: { error: { code: "card_declined", decline_code: "insufficient_funds" } } };
+        : {
+          status: 402,
+          body: {
+            error: {
+              code: "card_declined",
+              decline_code: typeof outcome === "object" ? outcome.stripeDecline : "insufficient_funds",
+            },
+          },
+        };
     case "adyen":
       return outcome === "approve"
         ? { status: 200, body: { resultCode: "Authorised", pspReference: `psp_${n}` } }
@@ -495,6 +505,38 @@ Deno.test("pipeline: two runs that read the same due row charge it once", async 
     assertEquals(summaries.map((s) => s.skipped).sort(), [0, 1]);
     assertEquals(p.net.charges.length, 1);
     assertEquals(p.net.requests.length, 1);
+  });
+});
+
+// ─── Decline codes (one table for the webhook and the worker) ────────────────
+
+Deno.test("pipeline: the webhook queues a generic_decline and drops a pickup_card", async () => {
+  await withPipeline([], async (p) => {
+    assertEquals((await p.deliver(paymentFailed("evt_g", "in_g", "generic_decline"))).body.accepted, true);
+    assertEquals(
+      await p.deliver(paymentFailed("evt_p", "in_p", "pickup_card")),
+      { status: 202, body: { accepted: false, reason: "not_soft_decline" } },
+    );
+    const rows = await p.db.rows();
+    assertEquals(rows.map((r) => [r.invoice_id, r.decline_category]), [["in_g", "do_not_honor"]]);
+  });
+});
+
+Deno.test("pipeline: a Stripe decline that must not be retried ends the row at once", async () => {
+  // Attempts 1 and 2 of a Stripe-origin row go to Adyen and Braintree, 3 to Stripe.
+  await withPipeline(["decline", "decline", { stripeDecline: "expired_card" }], async (p) => {
+    await ingest(p);
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await p.run();
+      p.clock.advance(DAY);
+    }
+    const row = await p.row();
+    assertEquals(
+      [row.status, row.retry_count, row.decline_category, row.schedule_reason],
+      ["blocked", 3, "expired_card", "blocked:not_retryable:expired_card"],
+    );
+    assertEquals(okSummary(await p.run()).processed, 0);
+    assertEquals(p.net.requests.length, 3);
   });
 });
 

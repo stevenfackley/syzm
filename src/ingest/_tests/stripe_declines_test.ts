@@ -1,19 +1,17 @@
 /**
- * Stripe decline codes are classified twice: by the retry worker when a retry
- * is declined (processors.ts, through retryPayment) and by the webhook when a
- * decline is ingested (normalize.ts mapRawCodeToCategory, which decides whether
- * the decline is queued at all). This table pins both answers for every code
- * either side lists, side by side. Rows marked DISAGREE are known drift that is
- * left for an owner decision; they are pinned so a change to either side shows.
+ * Stripe decline codes have one classification (_shared/declines.ts), used by
+ * the webhook when a decline is ingested (normalizeDecline: queue it or not)
+ * and by the retry worker when a retry is declined (retryPayment, then
+ * afterDecline: try again or stop). The parity test below sends every code
+ * through both real paths and fails if they ever disagree, on the category or
+ * on whether the decline is retried.
  */
 
 import { assertEquals } from "https://deno.land/std@0.224.0/assert/mod.ts";
-import { mapRawCodeToCategory } from "../_shared/normalize.ts";
-import {
-  type ProcessorCredentials,
-  retryPayment,
-  STRIPE_DECLINE_CATEGORIES,
-} from "../_shared/processors.ts";
+import { STRIPE_DECLINES } from "../_shared/declines.ts";
+import { normalizeDecline } from "../_shared/normalize.ts";
+import { type ProcessorCredentials, retryPayment, type RetryResult } from "../_shared/processors.ts";
+import { afterDecline } from "../_shared/retry-worker.ts";
 import type { DeclineCategory } from "../_shared/types.ts";
 
 const creds: ProcessorCredentials = {
@@ -40,77 +38,111 @@ function stripeError(error: Record<string, unknown> | undefined): typeof fetch {
     })) as typeof fetch;
 }
 
-/** What the retry worker records for a Stripe decline carrying this decline_code. */
-async function workerCategory(code: string): Promise<DeclineCategory> {
+/** The webhook path: a Stripe payment_failed event carrying this decline code. */
+function webhook(code: string): { category: DeclineCategory; retried: boolean } {
+  const event = {
+    id: "evt_decl",
+    type: "payment_intent.payment_failed",
+    data: { object: { invoice: "in_decl", amount_due: 1999, last_payment_error: { decline_code: code } } },
+  };
+  const n = normalizeDecline("stripe", event, "corr-decl");
+  return { category: n.decline_category, retried: n.soft_decline };
+}
+
+/** The worker path: Stripe declines the first retry with this code. */
+async function worker(code: string): Promise<{ category: DeclineCategory; retried: boolean; result: RetryResult }> {
   const result = await retryPayment("stripe", attempt, creds, "corr-decl", stripeError({ decline_code: code }));
   assertEquals(result.ok, false);
   assertEquals(result.rawDeclineCode, code);
-  return result.declineCategory;
+  return { category: result.declineCategory, retried: afterDecline(result, 1) === "rescheduled", result };
 }
 
-// [code, retry worker, webhook]
-const TABLE: Array<[string, DeclineCategory, DeclineCategory]> = [
-  ["insufficient_funds", "insufficient_funds", "insufficient_funds"],
-  ["do_not_honor", "do_not_honor", "do_not_honor"],
-  ["lost_card", "lost_stolen", "lost_stolen"],
-  ["stolen_card", "lost_stolen", "lost_stolen"],
-  ["fraudulent", "fraud", "fraud"],
-  ["fraud", "fraud", "fraud"],
-  ["expired_card", "expired_card", "expired_card"],
-  ["incorrect_number", "invalid_data", "invalid_data"],
-  ["invalid_number", "invalid_data", "invalid_data"],
-  ["issuer_not_available", "transient", "transient"],
-  ["processing_error", "transient", "transient"],
-  ["card_velocity_exceeded", "velocity", "velocity"],
-  ["withdrawal_count_limit_exceeded", "velocity", "velocity"],
-  ["authentication_required", "authentication_required", "authentication_required"],
-  // DISAGREE: codes only the worker lists; the webhook's substring rules answer differently.
-  ["card_decline_rate_limit_exceeded", "insufficient_funds", "velocity"],
-  ["generic_decline", "do_not_honor", "unknown"],
-  ["card_declined", "do_not_honor", "unknown"],
-  ["invalid_expiry_month", "invalid_data", "unknown"],
-  ["invalid_expiry_year", "invalid_data", "unknown"],
-  ["invalid_cvc", "invalid_data", "unknown"],
-  ["try_again_later", "transient", "unknown"],
-  // DISAGREE: codes neither lists; only the webhook's substring rules classify them.
-  ["issuer_unavailable", "unknown", "transient"],
-  ["51", "unknown", "insufficient_funds"],
-  ["some_new_limit_code", "unknown", "velocity"],
-  // Agree: unknown to both.
-  ["approve_with_id", "unknown", "unknown"],
-  ["constructor", "unknown", "unknown"],
-  ["__proto__", "unknown", "unknown"],
-  ["", "unknown", "unknown"],
+// Codes outside the table: case variants, codes the keyword fallback catches,
+// codes nothing knows, and object-prototype names.
+const PROBES = [
+  "GENERIC_DECLINE",
+  "Insufficient_Funds",
+  "51",
+  "issuer_unavailable",
+  "some_new_limit_code",
+  "some_new_fraud_code",
+  "some_lost_card_variant",
+  "some_new_code",
+  "constructor",
+  "__proto__",
 ];
 
-for (const [code, worker, webhook] of TABLE) {
-  Deno.test(`Stripe decline "${code}": worker ${worker}, webhook ${webhook}`, async () => {
-    assertEquals(await workerCategory(code), worker);
-    assertEquals(mapRawCodeToCategory("stripe", code), webhook);
-  });
-}
-
-Deno.test("Stripe decline: every shared code gets the shared answer on both sides", async () => {
-  const pinned = new Set(TABLE.map(([code]) => code));
-  for (const [code, category] of STRIPE_DECLINE_CATEGORIES) {
-    assertEquals(pinned.has(code), true, `${code} is missing from TABLE above`);
-    assertEquals(await workerCategory(code), category, code);
-    assertEquals(mapRawCodeToCategory("stripe", code), category, code);
+Deno.test("Stripe declines: the webhook and the worker agree on every code", async () => {
+  for (const code of [...STRIPE_DECLINES.keys(), ...PROBES]) {
+    const w = await worker(code);
+    const h = webhook(code);
+    assertEquals(h.category, w.category, `${code}: category`);
+    assertEquals(h.retried, w.retried, `${code}: webhook queues it = worker retries it`);
   }
 });
 
-Deno.test("Stripe decline: the worker matches codes case-sensitively", async () => {
-  // The webhook lower-cases before classifying (normalizeDecline); the worker does not.
-  assertEquals(await workerCategory("Insufficient_Funds"), "unknown");
-  assertEquals(await workerCategory("GENERIC_DECLINE"), "unknown");
+Deno.test("Stripe declines: the table decides what both paths do", async () => {
+  for (const [code, expected] of STRIPE_DECLINES) {
+    const w = await worker(code);
+    assertEquals({ category: w.category, retried: w.retried }, { category: expected.category, retried: expected.retryable }, code);
+  }
 });
 
-Deno.test("Stripe decline: the worker falls back to error.code, then to unknown", async () => {
+// The owner's decision of 2026-11-26 names these. Pinned so a change to the
+// table is a visible change to this list.
+const DECIDED: Array<[string, DeclineCategory, boolean]> = [
+  // The seven codes the worker retried and the webhook classified differently.
+  ["generic_decline", "do_not_honor", true],
+  ["card_declined", "do_not_honor", true],
+  ["try_again_later", "transient", true],
+  ["card_decline_rate_limit_exceeded", "velocity", true],
+  ["invalid_cvc", "invalid_data", false],
+  ["invalid_expiry_month", "invalid_data", false],
+  ["invalid_expiry_year", "invalid_data", false],
+  // Terminal because the customer has to act.
+  ["lost_card", "lost_stolen", false],
+  ["stolen_card", "lost_stolen", false],
+  ["pickup_card", "lost_stolen", false],
+  ["fraudulent", "fraud", false],
+  ["invalid_account", "invalid_data", false],
+];
+
+for (const [code, category, retryable] of DECIDED) {
+  Deno.test(`Stripe decline "${code}": ${category}, ${retryable ? "retried" : "not retried"} by both paths`, async () => {
+    assertEquals(STRIPE_DECLINES.get(code), { category, retryable });
+    const w = await worker(code);
+    assertEquals([w.category, w.retried], [category, retryable]);
+    assertEquals(webhook(code), { category, retried: retryable });
+  });
+}
+
+Deno.test("Stripe declines: table codes are lower-case, so the case-insensitive lookup reaches every row", () => {
+  for (const code of STRIPE_DECLINES.keys()) assertEquals(code, code.toLowerCase());
+});
+
+Deno.test("Stripe declines: a code nothing knows is retried by both, as Stripe retries every non-hard decline", async () => {
+  assertEquals((await worker("some_new_code")).retried, true);
+  assertEquals(webhook("some_new_code"), { category: "unknown", retried: true });
+});
+
+Deno.test("Stripe declines: a payload without a decline code is not queued", () => {
+  const n = normalizeDecline("stripe", { id: "evt_none", data: { object: { invoice: "in_none" } } }, "corr-none");
+  assertEquals([n.decline_code, n.decline_category, n.soft_decline], [null, "unknown", false]);
+});
+
+Deno.test("Stripe declines: the worker falls back to error.code, then to unknown", async () => {
   const byCode = await retryPayment("stripe", attempt, creds, "c1", stripeError({ code: "card_declined" }));
-  assertEquals(byCode.declineCategory, "do_not_honor");
-  assertEquals(byCode.rawDeclineCode, "card_declined");
+  assertEquals([byCode.declineCategory, byCode.rawDeclineCode, byCode.retryable], ["do_not_honor", "card_declined", true]);
 
   const empty = await retryPayment("stripe", attempt, creds, "c2", stripeError(undefined));
-  assertEquals(empty.declineCategory, "unknown");
-  assertEquals(empty.rawDeclineCode, "unknown");
+  assertEquals([empty.declineCategory, empty.rawDeclineCode, empty.retryable], ["unknown", "unknown", true]);
+});
+
+Deno.test("Stripe declines: a PaymentIntent that needs the customer is not retried", async () => {
+  for (const status of ["requires_action", "requires_payment_method"]) {
+    const fetchImpl = (async () =>
+      new Response(JSON.stringify({ id: "pi_1", status }), { status: 200 })) as typeof fetch;
+    const result = await retryPayment("stripe", attempt, creds, "c3", fetchImpl);
+    assertEquals([result.declineCategory, afterDecline(result, 1)], ["authentication_required", "blocked"]);
+  }
 });

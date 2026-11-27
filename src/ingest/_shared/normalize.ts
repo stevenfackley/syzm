@@ -3,7 +3,8 @@
  * import it (webhook.ts starts a server when imported).
  */
 
-import { mapAdyenRefusalReason, STRIPE_DECLINE_CATEGORIES } from "./processors.ts";
+import { classifyByKeywords, classifyStripeDecline } from "./declines.ts";
+import { mapAdyenRefusalReason } from "./processors.ts";
 import type { DeclineCategory, NormalizedDecline, ProcessorName } from "./types.ts";
 
 // Webhook payloads are loosely shaped per processor; a permissive record keeps
@@ -76,12 +77,7 @@ export function normalizeDecline(
   );
 
   const declineCategory = mapRawCodeToCategory(processor, rawDeclineCode);
-  const softDeclineCodes = new Set(["do_not_honor", "51", "insufficient_funds", "issuer_unavailable"]);
-  const softDecline =
-    softDeclineCodes.has(rawDeclineCode) ||
-    ["insufficient_funds", "do_not_honor", "transient", "velocity", "authentication_required"].includes(
-      declineCategory,
-    );
+  const softDecline = isQueueableDecline(processor, rawDeclineCode, declineCategory);
 
   return {
     invoice_id: invoiceId,
@@ -124,21 +120,30 @@ export function extractProcessorEventId(
 /** Classify the lower-cased decline code a webhook carries. */
 export function mapRawCodeToCategory(processor: ProcessorName, rawCode: string): DeclineCategory {
   if (!rawCode) return "unknown";
-  // Adyen sends refusal text ("Not enough balance"), which the generic rules below miss.
+  // Adyen sends refusal text ("Not enough balance"), which the generic rules miss.
   if (processor === "adyen") return mapAdyenRefusalReason(rawCode, "");
-  // Stripe-specific codes: the ones the retry worker classifies the same way.
-  if (processor === "stripe") {
-    const category = STRIPE_DECLINE_CATEGORIES.get(rawCode);
-    if (category) return category;
-  }
-  // Generic / shared
-  if (rawCode.includes("insufficient") || rawCode === "51") return "insufficient_funds";
-  if (rawCode.includes("fraud")) return "fraud";
-  if (rawCode.includes("stolen") || rawCode.includes("lost")) return "lost_stolen";
-  if (rawCode.includes("expired")) return "expired_card";
-  if (rawCode.includes("do_not_honor") || rawCode.includes("do not honour")) return "do_not_honor";
-  if (rawCode.includes("velocity") || rawCode.includes("limit")) return "velocity";
-  if (rawCode.includes("authentication")) return "authentication_required";
-  if (rawCode === "issuer_unavailable") return "transient";
-  return "unknown";
+  // Stripe: the table the retry worker classifies its own declines with.
+  if (processor === "stripe") return classifyStripeDecline(rawCode).category;
+  return classifyByKeywords(rawCode);
+}
+
+/** Categories the webhook queues for Adyen and Braintree declines. */
+const QUEUEABLE_CATEGORIES: ReadonlySet<DeclineCategory> = new Set<DeclineCategory>([
+  "insufficient_funds",
+  "do_not_honor",
+  "transient",
+  "velocity",
+  "authentication_required",
+]);
+const QUEUEABLE_CODES: ReadonlySet<string> = new Set(["do_not_honor", "51", "insufficient_funds", "issuer_unavailable"]);
+
+/**
+ * Whether the webhook queues a decline for retry. A payload without a decline
+ * code is not a decline. A Stripe code is queued exactly when the retry worker
+ * would retry it (declines.ts).
+ */
+function isQueueableDecline(processor: ProcessorName, rawCode: string, category: DeclineCategory): boolean {
+  if (!rawCode) return false;
+  if (processor === "stripe") return classifyStripeDecline(rawCode).retryable;
+  return QUEUEABLE_CODES.has(rawCode) || QUEUEABLE_CATEGORIES.has(category);
 }

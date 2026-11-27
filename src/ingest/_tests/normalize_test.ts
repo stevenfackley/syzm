@@ -3,6 +3,7 @@
  */
 
 import { assertEquals } from "https://deno.land/std@0.224.0/assert/mod.ts";
+import { STRIPE_DECLINES } from "../_shared/declines.ts";
 import { mapRawCodeToCategory, normalizeDecline, readAdyenDecline } from "../_shared/normalize.ts";
 import { mapAdyenRefusalReason } from "../_shared/processors.ts";
 import type { DeclineCategory } from "../_shared/types.ts";
@@ -213,36 +214,25 @@ Deno.test("normalizeDecline: raw code 51 is soft even where its category is unkn
   assertEquals(n.soft_decline, true);
 });
 
-Deno.test("normalizeDecline: soft categories are exactly the five the webhook queues", () => {
-  const soft: Record<DeclineCategory, boolean> = {
-    insufficient_funds: true,
-    do_not_honor: true,
-    transient: true,
-    velocity: true,
-    authentication_required: true,
-    expired_card: false,
-    invalid_data: false,
-    fraud: false,
-    lost_stolen: false,
-    unknown: false,
-  };
-  const codeFor: Record<DeclineCategory, string> = {
-    insufficient_funds: "insufficient_funds",
-    do_not_honor: "do_not_honor",
-    transient: "processing_error",
-    velocity: "card_velocity_exceeded",
-    authentication_required: "authentication_required",
-    expired_card: "expired_card",
-    invalid_data: "invalid_number",
-    fraud: "fraudulent",
-    lost_stolen: "lost_card",
-    unknown: "generic_decline",
-  };
+Deno.test("normalizeDecline: outside Stripe, soft categories are exactly the five the webhook queues", () => {
+  // Stripe codes are queued by the shared decline table (stripe_declines_test.ts).
+  // The keyword rules cannot produce invalid_data, so it is not listed.
+  const cases: Array<[DeclineCategory, string, boolean]> = [
+    ["insufficient_funds", "insufficient_funds", true],
+    ["do_not_honor", "do_not_honor", true],
+    ["transient", "issuer_unavailable", true],
+    ["velocity", "card_velocity_exceeded", true],
+    ["authentication_required", "authentication_required", true],
+    ["expired_card", "expired_card", false],
+    ["fraud", "fraudulent", false],
+    ["lost_stolen", "lost_card", false],
+    ["unknown", "generic_decline", false],
+  ];
 
-  for (const [category, code] of Object.entries(codeFor) as [DeclineCategory, string][]) {
-    const n = normalizeDecline("stripe", { decline_code: code }, "corr-soft");
+  for (const [category, code, soft] of cases) {
+    const n = normalizeDecline("braintree", { decline_code: code }, "corr-soft");
     assertEquals(n.decline_category, category, code);
-    assertEquals(n.soft_decline, soft[category], code);
+    assertEquals(n.soft_decline, soft, code);
   }
 });
 
@@ -315,11 +305,16 @@ const GENERIC: Array<[string, DeclineCategory]> = [
   ["constructor", "unknown"],
 ];
 
-Deno.test("mapRawCodeToCategory: generic rules, same for Stripe and Braintree", () => {
-  for (const processor of ["stripe", "braintree"] as const) {
-    for (const [code, category] of GENERIC) {
-      assertEquals(mapRawCodeToCategory(processor, code), category, `${processor}:${code}`);
-    }
+Deno.test("mapRawCodeToCategory: generic rules for Braintree", () => {
+  for (const [code, category] of GENERIC) {
+    assertEquals(mapRawCodeToCategory("braintree", code), category, code);
+  }
+});
+
+Deno.test("mapRawCodeToCategory: Stripe codes outside the decline table fall back to the generic rules", () => {
+  for (const [code, category] of GENERIC) {
+    if (STRIPE_DECLINES.has(code)) continue;
+    assertEquals(mapRawCodeToCategory("stripe", code), category, code);
   }
 });
 

@@ -5,7 +5,8 @@
  * repeat of the same attempt is not charged twice by Stripe or Adyen.
  */
 
-import type { DeclineCategory, ProcessorName } from "./types.ts";
+import { classifyStripeDecline } from "./declines.ts";
+import { type DeclineCategory, NO_RETRY_CATEGORIES, type ProcessorName } from "./types.ts";
 
 // ─── Public types ────────────────────────────────────────────────────────────
 
@@ -38,7 +39,16 @@ export type RetryResult = {
   processorReference?: string;
   /** Raw processor response code for audit trail. */
   rawDeclineCode?: string;
+  /**
+   * Whether a declined attempt may be tried again. Stripe: the decline table
+   * in declines.ts, which the webhook uses too. Adyen and Braintree: every
+   * category but fraud and lost_stolen (NO_RETRY_CATEGORIES).
+   */
+  retryable: boolean;
 };
+
+/** What an adapter returns; retryPayment fills `retryable` when it is left out. */
+type AdapterResult = Omit<RetryResult, "retryable"> & { retryable?: boolean };
 
 // ─── Processor credentials (injected at call time) ───────────────────────────
 
@@ -70,18 +80,22 @@ export async function retryPayment(
     }),
   );
 
-  let result: RetryResult;
+  let adapterResult: AdapterResult;
   switch (processor) {
     case "stripe":
-      result = await retryStripe(attempt, creds, fetchImpl);
+      adapterResult = await retryStripe(attempt, creds, fetchImpl);
       break;
     case "adyen":
-      result = await retryAdyen(attempt, creds, fetchImpl);
+      adapterResult = await retryAdyen(attempt, creds, fetchImpl);
       break;
     case "braintree":
-      result = await retryBraintree(attempt, creds, fetchImpl);
+      adapterResult = await retryBraintree(attempt, creds, fetchImpl);
       break;
   }
+  const result: RetryResult = {
+    ...adapterResult,
+    retryable: adapterResult.retryable ?? !NO_RETRY_CATEGORIES.has(adapterResult.declineCategory),
+  };
 
   console.log(
     JSON.stringify({
@@ -91,6 +105,7 @@ export async function retryPayment(
       ok: result.ok,
       decline_category: result.declineCategory,
       raw_decline_code: result.rawDeclineCode,
+      retryable: result.retryable,
       correlation_id: correlationId,
     }),
   );
@@ -112,7 +127,7 @@ async function readJsonBody(resp: Response): Promise<Record<string, unknown> | n
   }
 }
 
-function nonJsonResult(processor: ProcessorName, resp: Response): RetryResult {
+function nonJsonResult(processor: ProcessorName, resp: Response): AdapterResult {
   return {
     ok: false,
     processor,
@@ -133,7 +148,7 @@ async function retryStripe(
   attempt: RetryAttempt,
   creds: ProcessorCredentials,
   fetchImpl: typeof fetch,
-): Promise<RetryResult> {
+): Promise<AdapterResult> {
   const parts = attempt.paymentToken.split("|");
   if (parts.length < 2) {
     return {
@@ -141,6 +156,7 @@ async function retryStripe(
       processor: "stripe",
       declineCategory: "invalid_data",
       rawDeclineCode: "bad_payment_token",
+      retryable: false,
     };
   }
 
@@ -198,13 +214,16 @@ async function retryStripe(
         processorReference: json.id as string,
       };
     }
-    // requires_action / requires_payment_method → needs auth
+    // requires_action / requires_payment_method → needs the customer to
+    // authenticate or pay another way; Stripe lists authentication_required
+    // as a hard decline (declines.ts).
     if (status === "requires_action" || status === "requires_payment_method") {
       return {
         ok: false,
         processor: "stripe",
         declineCategory: "authentication_required",
         rawDeclineCode: status,
+        retryable: false,
       };
     }
   }
@@ -212,59 +231,14 @@ async function retryStripe(
   // Error path
   const err = (json.error ?? {}) as Record<string, unknown>;
   const rawCode = String(err.decline_code ?? err.code ?? "unknown");
+  const decline = classifyStripeDecline(rawCode);
   return {
     ok: false,
     processor: "stripe",
-    declineCategory: mapStripeDeclineCode(rawCode),
+    declineCategory: decline.category,
     rawDeclineCode: rawCode,
+    retryable: decline.retryable,
   };
-}
-
-/**
- * Stripe decline codes that the retry worker (mapStripeDeclineCode) and the
- * webhook (mapRawCodeToCategory in normalize.ts) classify the same way.
- * Lookups are exact and case-sensitive.
- */
-export const STRIPE_DECLINE_CATEGORIES: ReadonlyMap<string, DeclineCategory> = new Map<
-  string,
-  DeclineCategory
->([
-  ["insufficient_funds", "insufficient_funds"],
-  ["do_not_honor", "do_not_honor"],
-  ["lost_card", "lost_stolen"],
-  ["stolen_card", "lost_stolen"],
-  ["fraudulent", "fraud"],
-  ["fraud", "fraud"],
-  ["expired_card", "expired_card"],
-  ["incorrect_number", "invalid_data"],
-  ["invalid_number", "invalid_data"],
-  ["issuer_not_available", "transient"],
-  ["processing_error", "transient"],
-  ["card_velocity_exceeded", "velocity"],
-  ["withdrawal_count_limit_exceeded", "velocity"],
-  ["authentication_required", "authentication_required"],
-]);
-
-/**
- * Stripe codes only the retry worker classifies. The webhook sends each of these
- * through its substring rules and gets a different answer (noted per row; see
- * _tests/stripe_declines_test.ts). Which side is right is an open owner decision.
- */
-const STRIPE_RETRY_ONLY_CATEGORIES: ReadonlyMap<string, DeclineCategory> = new Map<
-  string,
-  DeclineCategory
->([
-  ["card_decline_rate_limit_exceeded", "insufficient_funds"], // webhook: velocity
-  ["generic_decline", "do_not_honor"], // webhook: unknown
-  ["card_declined", "do_not_honor"], // webhook: unknown
-  ["invalid_expiry_month", "invalid_data"], // webhook: unknown
-  ["invalid_expiry_year", "invalid_data"], // webhook: unknown
-  ["invalid_cvc", "invalid_data"], // webhook: unknown
-  ["try_again_later", "transient"], // webhook: unknown
-]);
-
-function mapStripeDeclineCode(code: string): DeclineCategory {
-  return STRIPE_DECLINE_CATEGORIES.get(code) ?? STRIPE_RETRY_ONLY_CATEGORIES.get(code) ?? "unknown";
 }
 
 // ─── Adyen ───────────────────────────────────────────────────────────────────
@@ -278,7 +252,7 @@ async function retryAdyen(
   attempt: RetryAttempt,
   creds: ProcessorCredentials,
   fetchImpl: typeof fetch,
-): Promise<RetryResult> {
+): Promise<AdapterResult> {
   const parts = attempt.paymentToken.split("|");
   if (parts.length < 2) {
     return {
@@ -370,7 +344,7 @@ async function retryBraintree(
   attempt: RetryAttempt,
   creds: ProcessorCredentials,
   fetchImpl: typeof fetch,
-): Promise<RetryResult> {
+): Promise<AdapterResult> {
   const paymentMethodToken = attempt.paymentToken;
   const idempotencyKey = attempt.idempotencyKey;
 
