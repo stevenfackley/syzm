@@ -35,6 +35,8 @@ The retry worker claims a due row before charging it: `status` goes from `pendin
 
 A run that dies after the claim leaves the row `retrying`, and so does an answer that does not say whether the card was charged: a network error, an HTTP status of 500 or above, a 409, or a body that is not JSON. Once `claimed_at` is 15 minutes old a later run takes the row over and repeats the attempt with the same key, so a charge that went through but was never recorded is answered from the processor's record, not charged again. That happens only for Stripe and Adyen, and only within 23 hours of `attempt_started_at` (Stripe drops keys after 24 hours). Otherwise the row ends `error` with `schedule_reason = 'outcome_unknown:<processor>'` and needs reconciling by hand: look the attempt key (`syzm-<row id>-attempt-<retry_count + 1>`) up at the processor.
 
+A 401, 403 or 429 means the processor refused the request before any attempt. The row goes back to `pending` without spending an attempt, `scheduled_at` moves 15 minutes on, and the same attempt goes out again under the same key. If that attempt had already been sent once with an unknown outcome, `attempt_started_at` stays set on the `pending` row, so the 23-hour limit still applies to it.
+
 `retry_count` counts attempts made: `0`-`4`, and `4` only on a finished row (`recovered`, `exhausted`, `blocked`, `error`).
 
 ---
