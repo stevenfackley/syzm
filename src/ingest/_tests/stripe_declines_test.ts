@@ -38,20 +38,33 @@ function stripeError(error: Record<string, unknown> | undefined): typeof fetch {
     })) as typeof fetch;
 }
 
-/** The webhook path: a Stripe payment_failed event carrying this decline code. */
-function webhook(code: string): { category: DeclineCategory; retried: boolean } {
+/**
+ * The shapes a Stripe error object carries a code in: a card decline sets
+ * code card_declined plus decline_code; some declines come as code only.
+ */
+const SHAPES: Array<[string, (code: string) => Record<string, string>]> = [
+  ["decline_code only", (code) => ({ decline_code: code })],
+  ["code only", (code) => ({ code })],
+  ["code card_declined + decline_code", (code) => ({ code: "card_declined", decline_code: code })],
+];
+
+/** The webhook path: a Stripe payment_failed event whose last_payment_error carries the code. */
+function webhook(code: string, shape = SHAPES[0][1]): { category: DeclineCategory; retried: boolean } {
   const event = {
     id: "evt_decl",
     type: "payment_intent.payment_failed",
-    data: { object: { invoice: "in_decl", amount_due: 1999, last_payment_error: { decline_code: code } } },
+    data: { object: { invoice: "in_decl", amount_due: 1999, last_payment_error: shape(code) } },
   };
   const n = normalizeDecline("stripe", event, "corr-decl");
   return { category: n.decline_category, retried: n.soft_decline };
 }
 
-/** The worker path: Stripe declines the first retry with this code. */
-async function worker(code: string): Promise<{ category: DeclineCategory; retried: boolean; result: RetryResult }> {
-  const result = await retryPayment("stripe", attempt, creds, "corr-decl", stripeError({ decline_code: code }));
+/** The worker path: Stripe declines the first retry with an error object carrying the code. */
+async function worker(
+  code: string,
+  shape = SHAPES[0][1],
+): Promise<{ category: DeclineCategory; retried: boolean; result: RetryResult }> {
+  const result = await retryPayment("stripe", attempt, creds, "corr-decl", stripeError(shape(code)));
   assertEquals(result.ok, false);
   assertEquals(result.rawDeclineCode, code);
   return { category: result.declineCategory, retried: afterDecline(result, 1) === "rescheduled", result };
@@ -72,12 +85,17 @@ const PROBES = [
   "__proto__",
 ];
 
-Deno.test("Stripe declines: the webhook and the worker agree on every code", async () => {
+Deno.test("Stripe declines: the webhook and the worker agree on every code, however Stripe sends it", async () => {
   for (const code of [...STRIPE_DECLINES.keys(), ...PROBES]) {
-    const w = await worker(code);
-    const h = webhook(code);
-    assertEquals(h.category, w.category, `${code}: category`);
-    assertEquals(h.retried, w.retried, `${code}: webhook queues it = worker retries it`);
+    for (const [shapeName, shape] of SHAPES) {
+      const w = await worker(code, shape);
+      const h = webhook(code, shape);
+      const label = `${code} (${shapeName})`;
+      assertEquals(h.category, w.category, `${label}: category`);
+      assertEquals(h.retried, w.retried, `${label}: webhook queues it = worker retries it`);
+      // The shape does not change the answer.
+      assertEquals([w.category, w.retried], [(await worker(code)).category, (await worker(code)).retried], label);
+    }
   }
 });
 

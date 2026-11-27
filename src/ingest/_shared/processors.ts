@@ -5,7 +5,7 @@
  * repeat of the same attempt is not charged twice by Stripe or Adyen.
  */
 
-import { classifyStripeDecline } from "./declines.ts";
+import { classifyStripeDecline, stripeErrorCode } from "./declines.ts";
 import { type DeclineCategory, NO_RETRY_CATEGORIES, type ProcessorName } from "./types.ts";
 
 // ─── Public types ────────────────────────────────────────────────────────────
@@ -230,7 +230,7 @@ async function retryStripe(
 
   // Error path
   const err = (json.error ?? {}) as Record<string, unknown>;
-  const rawCode = String(err.decline_code ?? err.code ?? "unknown");
+  const rawCode = stripeErrorCode(err) ?? "unknown";
   const decline = classifyStripeDecline(rawCode);
   return {
     ok: false,

@@ -3,7 +3,7 @@
  * import it (webhook.ts starts a server when imported).
  */
 
-import { classifyByKeywords, classifyStripeDecline } from "./declines.ts";
+import { classifyByKeywords, classifyStripeDecline, stripeErrorCode } from "./declines.ts";
 import { mapAdyenRefusalReason } from "./processors.ts";
 import type { DeclineCategory, NormalizedDecline, ProcessorName } from "./types.ts";
 
@@ -61,7 +61,7 @@ export function normalizeDecline(
   const rawDeclineCode = String(
     p.decline_code ??
       p.declineCode ??
-      obj.last_payment_error?.decline_code ??
+      stripeErrorCode(obj.last_payment_error) ??
       // Adyen
       adyen.reason ??
       p.refusalReason ??

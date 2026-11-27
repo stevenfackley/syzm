@@ -123,6 +123,20 @@ export function classifyStripeDecline(code: string): StripeDecline {
   return { category, retryable: !TERMINAL_CATEGORIES.has(category) };
 }
 
+/**
+ * The code a Stripe error object carries: its decline_code, else its code.
+ * Stripe sends some declines with a code and no decline_code
+ * (card_decline_rate_limit_exceeded, processing_error). The webhook reads a
+ * PaymentIntent's last_payment_error and the worker reads an API error body
+ * with this same function, so both see the same code.
+ */
+export function stripeErrorCode(error: unknown): string | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const e = error as { decline_code?: unknown; code?: unknown };
+  const code = e.decline_code ?? e.code;
+  return code === undefined || code === null ? undefined : String(code);
+}
+
 /** Best-effort classification of a lower-cased code from any processor. */
 export function classifyByKeywords(rawCode: string): DeclineCategory {
   if (!rawCode) return "unknown";
